@@ -712,7 +712,7 @@ def display_tat_dashboard(processed_dataframes=None, current_df=None, sheet_name
         50% { opacity: 0; }
     }
     </style>
-    <div class="blink-msg">⚠️ We are under maintenance. Stay tuned...</div>
+    <div class="blink-msg">⚠️ We are under maintenance. Stay tuned....</div>
     """, unsafe_allow_html=True)
 
     st.title("🔄 Restore & TAT Analysis")
