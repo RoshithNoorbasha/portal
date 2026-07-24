@@ -91,7 +91,7 @@ MANUAL_SCADA_COLUMNS = [
 ROLE_BADGES = {
     "admin": "👑 Admin",
     "manager": "🧭 Manager",
-    "engineer": "🔧 Engineer",
+    "engineer": "💼 DM/AM",
 }
 
 # ==========================================
