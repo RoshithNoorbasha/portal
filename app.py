@@ -77,6 +77,21 @@ INVERTER_ID_COLS = [
     "Device Name", "String Inverter", "Inverters"
 ]
 
+
+def sorted_filter_options(series):
+    """Return non-null unique values sorted safely for Streamlit filters."""
+    values = [value for value in series.dropna().unique()]
+
+    def natural_key(value):
+        text = str(value).strip()
+        return tuple(
+            (0, int(part)) if part.isdigit() else (1, part.casefold())
+            for part in re.split(r"(\d+)", text)
+        )
+
+    return sorted(values, key=natural_key)
+
+
 MANUAL_SCADA_COLUMNS = [
     "String Inverter", "MBUS", "Grid", "E-Daily(KWH)", "Active Power", "Reactive Power",
     "PV1", "PV2", "PV3", "PV4", "PV5", "PV6", "PV7", "PV8", "PV9", "PV10",
@@ -529,11 +544,11 @@ def audit_log_tab():
 
     filter_col1, filter_col2, metric_col = st.columns([1, 1, 1])
     with filter_col1:
-        event_types = ["All"] + sorted(df_audit["event_type"].unique())
+        event_types = ["All"] + sorted_filter_options(df_audit["event_type"])
         selected_event = st.selectbox("Filter by Event Type", event_types, key="audit_event_filter")
     with filter_col2:
         if role == "admin":
-            users_in_log = ["All"] + sorted(df_audit["username"].unique())
+            users_in_log = ["All"] + sorted_filter_options(df_audit["username"])
             selected_user = st.selectbox("Filter by User", users_in_log, key="audit_user_filter")
         else:
             selected_user = "All"
@@ -579,19 +594,19 @@ def create_pv_string_tab(df):
 
     col1, col2, col3, col4, col5 = st.columns(5)
     with col1:
-        available_plots = sorted(df["Plot"].unique())
+        available_plots = sorted_filter_options(df["Plot"])
         selected_plot = st.selectbox("Filter by Plot", ["All"] + available_plots, key="pv_plot_filter")
     with col2:
         filtered_by_plot = df if selected_plot == "All" else df[df["Plot"] == selected_plot]
-        available_blocks = sorted(filtered_by_plot["Block"].unique())
+        available_blocks = sorted_filter_options(filtered_by_plot["Block"])
         selected_block = st.selectbox("Filter by Block", ["All"] + available_blocks, key="pv_block_filter")
     with col3:
         filtered_by_block = filtered_by_plot if selected_block == "All" else filtered_by_plot[filtered_by_plot["Block"] == selected_block]
-        available_sacus = sorted(filtered_by_block["SACU"].unique())
+        available_sacus = sorted_filter_options(filtered_by_block["SACU"])
         selected_sacu = st.selectbox("Filter by SACU", ["All"] + available_sacus, key="pv_sacu_filter")
     with col4:
         filtered_by_sacu = filtered_by_block if selected_sacu == "All" else filtered_by_block[filtered_by_block["SACU"] == selected_sacu]
-        available_inverters = sorted(filtered_by_sacu[inverter_col].unique())
+        available_inverters = sorted_filter_options(filtered_by_sacu[inverter_col])
         selected_inverter = st.selectbox("Filter by Inverter", ["All"] + available_inverters, key="pv_inverter_filter")
     with col5:
         show_voltage = st.checkbox("Show Voltage", value=False, key="show_voltage")
@@ -788,7 +803,7 @@ def create_pv_string_tab(df):
 
         st.markdown("---")
         st.subheader("🔍 Individual Inverter Analysis")
-        inverter_list = sorted(filtered_df[inverter_col].unique())
+        inverter_list = sorted_filter_options(filtered_df[inverter_col])
         selected_single_inverter = st.selectbox("Select Inverter for Detailed View", inverter_list, key="single_inverter_view")
 
         if selected_single_inverter:
@@ -1293,19 +1308,19 @@ def main():
     st.sidebar.markdown("---")
     st.sidebar.subheader("Filters")
 
-    plots = ["All"] + sorted([p for p in df_selected["Plot"].dropna().unique()])
+    plots = ["All"] + sorted_filter_options(df_selected["Plot"])
     selected_plot = st.sidebar.selectbox("Plot", plots)
 
     filtered_df = df_selected.copy()
     if selected_plot != "All":
         filtered_df = filtered_df[filtered_df["Plot"] == selected_plot]
 
-    blocks = ["All"] + sorted([b for b in filtered_df["Block"].dropna().unique()])
+    blocks = ["All"] + sorted_filter_options(filtered_df["Block"])
     selected_block = st.sidebar.selectbox("Block", blocks)
     if selected_block != "All":
         filtered_df = filtered_df[filtered_df["Block"] == selected_block]
 
-    sacus = ["All"] + sorted([s for s in filtered_df["SACU"].dropna().unique()])
+    sacus = ["All"] + sorted_filter_options(filtered_df["SACU"])
     selected_sacu = st.sidebar.selectbox("SACU", sacus)
     if selected_sacu != "All":
         filtered_df = filtered_df[filtered_df["SACU"] == selected_sacu]
