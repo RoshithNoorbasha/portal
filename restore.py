@@ -689,11 +689,34 @@ def display_calendar_comparison(sheet_name="Sheet1"):
 # ==========================================
 # MAIN ENTRY
 # ==========================================
+# def display_tat_dashboard(processed_dataframes=None, current_df=None, sheet_name="Sheet1",
+#                            user_role="viewer", username="unknown", upload_handler=None):
+#     st.title("🔄 Restore & TAT Analysis")
+#     st.caption("Day-wise SCADA snapshots (uploaded from the sidebar) power history, TAT, and calendar comparisons.")
+import streamlit as st
+
 def display_tat_dashboard(processed_dataframes=None, current_df=None, sheet_name="Sheet1",
                            user_role="viewer", username="unknown", upload_handler=None):
+    st.markdown("""
+    <style>
+    .blink-msg {
+        font-size: 18px;
+        font-weight: 700;
+        color: #d62828;
+        animation: blink 1s linear infinite;
+        text-align: center;
+        padding: 10px 0;
+    }
+    @keyframes blink {
+        0%, 100% { opacity: 1; }
+        50% { opacity: 0; }
+    }
+    </style>
+    <div class="blink-msg">⚠️ We are under maintenance. Stay tuned....</div>
+    """, unsafe_allow_html=True)
+
     st.title("🔄 Restore & TAT Analysis")
     st.caption("Day-wise SCADA snapshots (uploaded from the sidebar) power history, TAT, and calendar comparisons.")
-
     init_history()
     history = load_string_history()
 
