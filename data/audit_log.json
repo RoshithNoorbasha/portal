@@ -8,6 +8,15 @@
       "timestamp": "2026-07-31 17:15:15",
       "prev_hash": "0",
       "entry_hash": "eaa21861e328d6ddcaceccdce8f8721c0c2b41b14c3724185aa8aceb06ac1b7a"
+    },
+    {
+      "username": "super_admin",
+      "role": "admin",
+      "event_type": "login",
+      "details": {},
+      "timestamp": "2026-07-31 17:22:40",
+      "prev_hash": "eaa21861e328d6ddcaceccdce8f8721c0c2b41b14c3724185aa8aceb06ac1b7a",
+      "entry_hash": "af86932baa9631bfeb7e358765646483fd3876fc8f4585b326ac0a2980cd8953"
     }
   ]
 }
