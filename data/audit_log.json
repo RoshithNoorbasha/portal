@@ -1,0 +1,13 @@
+{
+  "entries": [
+    {
+      "username": "super_admin",
+      "role": "admin",
+      "event_type": "login",
+      "details": {},
+      "timestamp": "2026-07-31 17:15:15",
+      "prev_hash": "0",
+      "entry_hash": "eaa21861e328d6ddcaceccdce8f8721c0c2b41b14c3724185aa8aceb06ac1b7a"
+    }
+  ]
+}

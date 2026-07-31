@@ -1,0 +1,25 @@
+{
+  "exported_at": "2026-07-31 17:15:29",
+  "user_count": 1,
+  "users": {
+    "super_admin": {
+      "password": "25489eee62eabadac136fda74d5c2a2e084bd061ad5f1ebe4e1bc124487c09ec",
+      "role": "admin",
+      "full_name": "System Administrator",
+      "assigned_plots": [
+        "P1",
+        "P2",
+        "P3",
+        "P4",
+        "P5",
+        "P6",
+        "P7",
+        "P8",
+        "P9",
+        "P10"
+      ],
+      "created_at": "2026-07-31T17:14:52.450550",
+      "created_by": "system"
+    }
+  }
+}

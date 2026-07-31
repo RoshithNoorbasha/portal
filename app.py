@@ -158,6 +158,23 @@ INVERTER_ID_COLS = [
     "Device Name", "String Inverter", "Inverters"
 ]
 
+MANUAL_SCADA_COLUMNS = [
+    "String Inverter", "MBUS", "Grid", "E-Daily(KWH)", "Active Power", "Reactive Power",
+    "PV1", "PV2", "PV3", "PV4", "PV5", "PV6", "PV7", "PV8", "PV9", "PV10",
+    "PV11", "PV12", "PV13", "PV14", "PV15", "PV16", "PV17", "PV18", "PV19", "PV20",
+    "PV21", "PV22", "PV23", "PV24", "PV25", "PV26", "PV27", "PV28",
+    "PV-I1", "PV-I2", "PV-I3", "PV-I4", "PV-I5", "PV-I6", "PV-I7", "PV-I8", "PV-I9", "PV-I10",
+    "PV-I11", "PV-I12", "PV-I13", "PV-I14", "PV-I15", "PV-I16", "PV-I17", "PV-I18", "PV-I19", "PV-I20",
+    "PV-I21", "PV-I22", "PV-I23", "PV-I24", "PV-I25", "PV-I26", "PV-I27", "PV-I28",
+    "VAB", "VBC", "VCA", "IA", "IB", "IC"
+]
+
+ROLE_BADGES = {
+    "admin": "👑 Admin",
+    "manager": "🧭 Manager",
+    "engineer": "🔧 Engineer",
+}
+
 # ==========================================
 # 3. USER / SESSION HELPERS (delegates to storage.py)
 # ==========================================

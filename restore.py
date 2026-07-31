@@ -1082,12 +1082,17 @@ def display_calendar_comparison(sheet_name="Sheet1"):
 # ==========================================
 # MAIN ENTRY
 # ==========================================
+# def display_tat_dashboard(processed_dataframes=None, current_df=None, sheet_name="Sheet1",
+#                            user_role="viewer", username="unknown", upload_handler=None):
+#     st.title("🔄 Restore & TAT Analysis")
+#     st.caption("Day-wise SCADA snapshots (uploaded from the sidebar) power history, TAT, and calendar comparisons.")
+import streamlit as st
+
 def display_tat_dashboard(processed_dataframes=None, current_df=None, sheet_name="Sheet1",
                            user_role="viewer", username="unknown", upload_handler=None):
     """Main entry point for the Restore & TAT dashboard."""
-    st.title("Restore & TAT Analysis")
-    st.caption("Day-wise SCADA snapshots power the summary, history matrix, and calendar comparison below.")
-
+    st.title("🔄 Restore & TAT Analysis")
+    st.caption("Day-wise SCADA snapshots power history, TAT, and calendar comparisons.")
     init_history()
     history = load_string_history()
 
