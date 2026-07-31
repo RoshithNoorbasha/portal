@@ -1,0 +1,29 @@
+{
+  "super_admin": {
+    "password": "25489eee62eabadac136fda74d5c2a2e084bd061ad5f1ebe4e1bc124487c09ec",
+    "role": "admin",
+    "full_name": "System Administrator",
+    "assigned_plots": [
+      "P1",
+      "P2",
+      "P3",
+      "P4",
+      "P5",
+      "P6",
+      "P7",
+      "P8",
+      "P9",
+      "P10"
+    ],
+    "created_at": "2026-07-27T18:20:51.093481",
+    "created_by": "system"
+  },
+  "roshith": {
+    "password": "1390ab42e6f0ed1e185a91792752b26da564a0be002464fe7078cfba8c1edf22",
+    "role": "admin",
+    "full_name": "Roshith",
+    "assigned_plots": [],
+    "created_at": "2026-07-31T16:57:17.736964",
+    "created_by": "super_admin"
+  }
+}

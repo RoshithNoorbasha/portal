@@ -1,0 +1,17 @@
+{
+  "uploads": [
+    {
+      "upload_id": "20260731_163927_2e0d94d0",
+      "original_filename": "30-07-2026.xlsx",
+      "original_ext": ".xlsx",
+      "upload_timestamp": "2026-07-31 16:39:27",
+      "snapshot_date": "2026-07-30",
+      "file_hash": "2e0d94d0558d811cd36e2f0e457374d3",
+      "file_size": 1187545,
+      "uploaded_by": "super_admin",
+      "saved_sheets": [
+        "Sheet1"
+      ]
+    }
+  ]
+}

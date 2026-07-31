@@ -18,6 +18,7 @@ Having ONE registry file for uploads means:
 
 import hashlib
 import json
+import time
 from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
@@ -37,16 +38,48 @@ PREPROCESS_REGISTRY_FILE = PREPROCESS_DIR / "registry.json"
 USERS_FILE = DATA_DIR / "users.json"
 AUDIT_FILE = DATA_DIR / "audit_log.json"
 
+# ==========================================
+# UPLOAD LOCK - Prevent concurrent uploads
+# ==========================================
+_UPLOAD_LOCK = False
+_UPLOAD_LOCK_FILE = PREPROCESS_DIR / ".upload_lock"
+
+
+def _acquire_upload_lock():
+    """Try to acquire upload lock to prevent concurrent uploads"""
+    global _UPLOAD_LOCK
+    if _UPLOAD_LOCK:
+        return False
+    
+    try:
+        if _UPLOAD_LOCK_FILE.exists():
+            lock_time = _UPLOAD_LOCK_FILE.stat().st_mtime
+            # If lock is older than 30 seconds, consider it stale
+            if time.time() - lock_time > 30:
+                _UPLOAD_LOCK_FILE.unlink()
+            else:
+                return False
+        
+        _UPLOAD_LOCK_FILE.write_text(str(time.time()))
+        _UPLOAD_LOCK = True
+        return True
+    except:
+        return False
+
+
+def _release_upload_lock():
+    """Release the upload lock"""
+    global _UPLOAD_LOCK
+    _UPLOAD_LOCK = False
+    try:
+        if _UPLOAD_LOCK_FILE.exists():
+            _UPLOAD_LOCK_FILE.unlink()
+    except:
+        pass
 
 # ==========================================
 # GENERIC JSON HELPERS
 # ==========================================
-# Lightweight mtime-based cache: Streamlit re-runs the whole script on
-# every widget interaction, and without this, every rerun was re-opening
-# and re-parsing registry.json / users.json / audit_log.json several
-# times each (this was the main source of the "laggy" UI). We keep a
-# tiny in-memory cache keyed by path, and only re-read from disk when the
-# file's mtime has actually changed - i.e. someone wrote to it.
 _JSON_CACHE = {}
 
 
@@ -80,10 +113,13 @@ def _write_json(path: Path, data):
         mtime = path.stat().st_mtime
     except OSError:
         mtime = None
-    # Update the cache immediately so the writer's own next read (in the
-    # same rerun) doesn't need to hit disk again.
     _JSON_CACHE[path] = (mtime, data)
 
+
+def _invalidate_cache():
+    """Clear the JSON cache to force fresh reads"""
+    global _JSON_CACHE
+    _JSON_CACHE = {}
 
 # ==========================================
 # 1. PREPROCESSED UPLOAD REGISTRY
@@ -97,62 +133,100 @@ def _load_registry():
 
 def _save_registry(data):
     _write_json(PREPROCESS_REGISTRY_FILE, data)
+    _invalidate_cache()  # Force cache refresh after write
 
 
 def save_preprocessed_upload(file_bytes, original_filename, processed_dataframes,
                               snapshot_date, uploaded_by):
     """
     Persist a newly uploaded + processed SCADA workbook.
-
-    - Saves the raw excel bytes (so it can be re-downloaded / re-processed later)
-    - Saves every processed sheet as a CSV (so restore.py never needs to
-      re-parse the excel to compare two dates)
-    - Adds ONE entry to the single registry.json
-
-    snapshot_date: 'YYYY-MM-DD' string - the calendar date this upload
-                   represents, used for day-wise / range comparisons.
-    Returns the new upload_id.
+    Ensures only ONE file is stored per snapshot_date.
     """
-    file_hash = hashlib.md5(file_bytes).hexdigest()
-    timestamp = datetime.now()
-    upload_id = f"{timestamp.strftime('%Y%m%d_%H%M%S')}_{file_hash[:8]}"
-
-    upload_path = PREPROCESS_DIR / upload_id
-    upload_path.mkdir(parents=True, exist_ok=True)
-
-    ext = Path(original_filename).suffix or ".xlsx"
-    with open(upload_path / f"original{ext}", "wb") as f:
-        f.write(file_bytes)
-
-    saved_sheets = []
-    for sheet_name, df in processed_dataframes.items():
-        if df is not None and not df.empty:
-            safe_sheet = str(sheet_name).replace("/", "_").replace("\\", "_")
-            df.to_csv(upload_path / f"{safe_sheet}.csv", index=False)
-            saved_sheets.append(sheet_name)
-
-    entry = {
-        "upload_id": upload_id,
-        "original_filename": original_filename,
-        "original_ext": ext,
-        "upload_timestamp": timestamp.strftime("%Y-%m-%d %H:%M:%S"),
-        "snapshot_date": str(snapshot_date),
-        "file_hash": file_hash,
-        "file_size": len(file_bytes),
-        "uploaded_by": uploaded_by,
-        "saved_sheets": saved_sheets,
-    }
-
-    registry = _load_registry()
-    # Replace any earlier upload for the exact same file+date (avoid duplicates)
-    registry["uploads"] = [
-        u for u in registry["uploads"]
-        if not (u.get("file_hash") == file_hash and u.get("snapshot_date") == entry["snapshot_date"])
-    ]
-    registry["uploads"].append(entry)
-    registry["uploads"] = sorted(registry["uploads"], key=lambda x: x["upload_timestamp"])
-    _save_registry(registry)
-    return upload_id
+    # Acquire lock to prevent concurrent uploads
+    if not _acquire_upload_lock():
+        time.sleep(1)  # Wait a moment and try again
+        if not _acquire_upload_lock():
+            return None, "Upload in progress, please wait..."
+    
+    try:
+        file_hash = hashlib.md5(file_bytes).hexdigest()
+        snapshot_date_str = str(snapshot_date)
+        
+        # Load existing registry
+        registry = _load_registry()
+        
+        # Check if we already have an upload for this date
+        existing_upload = None
+        existing_idx = None
+        
+        for idx, u in enumerate(registry["uploads"]):
+            if u.get("snapshot_date") == snapshot_date_str:
+                existing_upload = u
+                existing_idx = idx
+                break
+        
+        # If exists with same hash, return existing ID
+        if existing_upload and existing_upload.get("file_hash") == file_hash:
+            return existing_upload["upload_id"], f"File already exists for {snapshot_date_str}"
+        
+        # Generate unique upload ID
+        timestamp = datetime.now()
+        upload_id = f"{timestamp.strftime('%Y%m%d_%H%M%S')}_{file_hash[:8]}"
+        
+        # If we have an existing upload for this date, use the same ID to replace it
+        if existing_upload and existing_idx is not None:
+            upload_id = existing_upload["upload_id"]
+            # Clean up old files
+            old_path = PREPROCESS_DIR / upload_id
+            import shutil
+            if old_path.exists():
+                shutil.rmtree(old_path)
+        
+        # Create upload directory
+        upload_path = PREPROCESS_DIR / upload_id
+        upload_path.mkdir(parents=True, exist_ok=True)
+        
+        # Save original file
+        ext = Path(original_filename).suffix or ".xlsx"
+        with open(upload_path / f"original{ext}", "wb") as f:
+            f.write(file_bytes)
+        
+        # Save processed sheets
+        saved_sheets = []
+        for sheet_name, df in processed_dataframes.items():
+            if df is not None and not df.empty:
+                safe_sheet = str(sheet_name).replace("/", "_").replace("\\", "_")
+                df.to_csv(upload_path / f"{safe_sheet}.csv", index=False)
+                saved_sheets.append(sheet_name)
+        
+        # Create entry
+        entry = {
+            "upload_id": upload_id,
+            "original_filename": original_filename,
+            "original_ext": ext,
+            "upload_timestamp": timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+            "snapshot_date": snapshot_date_str,
+            "file_hash": file_hash,
+            "file_size": len(file_bytes),
+            "uploaded_by": uploaded_by,
+            "saved_sheets": saved_sheets,
+        }
+        
+        # Update registry
+        if existing_idx is not None:
+            registry["uploads"][existing_idx] = entry
+        else:
+            registry["uploads"].append(entry)
+        
+        # Sort by timestamp
+        registry["uploads"] = sorted(registry["uploads"], key=lambda x: x["upload_timestamp"])
+        _save_registry(registry)
+        
+        return upload_id, f"File uploaded and saved for {snapshot_date_str}"
+    
+    finally:
+        # Always release lock
+        _release_upload_lock()
 
 
 def get_all_uploads():
@@ -208,8 +282,6 @@ def load_sheet_csv(upload_id, sheet_name):
     safe_sheet = str(sheet_name).replace("/", "_").replace("\\", "_")
     path = PREPROCESS_DIR / upload_id / f"{safe_sheet}.csv"
     if path.exists():
-        # Return a copy so callers mutating the frame don't corrupt the
-        # cached original used by other callers/reruns.
         return _read_csv_cached(str(path), path.stat().st_mtime).copy()
     return None
 
@@ -236,12 +308,10 @@ def load_users():
 
 def save_users(users):
     _write_json(USERS_FILE, users)
+    _invalidate_cache()
 
 
 _DEFAULT_ADMIN_USERNAME = "super_admin"
-# Only the salted SHA-256 hash of this password is ever persisted to disk
-# (see _hash_password below / users.json) - the plaintext never gets
-# written anywhere and only exists transiently at first-run time.
 _DEFAULT_ADMIN_PASSWORD = "super_admin@scada@56433"
 
 
@@ -298,8 +368,6 @@ def can_change_role(role):
 
 
 def can_view_audit_log(role):
-    """Every authenticated role can see *some* slice of the audit log now
-    - see get_audit_log_for() for the actual scoping rules."""
     return role in ("admin", "manager", "engineer")
 
 
@@ -363,9 +431,6 @@ MIN_PASSWORD_LENGTH = 6
 
 
 def reset_password(username, new_password):
-    """Reset a user's password - used both for self-service 'change my
-    password' and for an admin/manager resetting a password on behalf of
-    someone who's locked themselves out."""
     if not new_password or len(new_password) < MIN_PASSWORD_LENGTH:
         return False, f"Password must be at least {MIN_PASSWORD_LENGTH} characters."
     users = load_users()
@@ -377,11 +442,6 @@ def reset_password(username, new_password):
 
 
 def can_reset_password_for(actor_role, target_role):
-    """Who is allowed to reset whose password.
-    - admin can reset anyone's password (including other admins)
-    - manager can only reset engineer passwords
-    - engineer cannot reset anyone else's password
-    """
     if actor_role == "admin":
         return True
     if actor_role == "manager":
@@ -409,14 +469,6 @@ def _entry_hash(body: dict) -> str:
 
 
 def log_audit_event(username, role, event_type, details=None):
-    """
-    event_type examples: 'login', 'logout', 'download_report',
-    'user_created', 'user_deleted', 'plots_assigned', 'file_uploaded'
-
-    Every entry stores the hash of the previous entry plus its own hash,
-    so the log forms a tamper-evident chain (like a mini blockchain) -
-    if any historical entry is edited, verify_audit_chain() will fail.
-    """
     data = _load_audit()
     entries = data["entries"]
     prev_hash = entries[-1]["entry_hash"] if entries else "0"
@@ -442,7 +494,6 @@ def get_audit_log():
 
 
 def verify_audit_chain():
-    """True if no entry in the audit log has been tampered with."""
     entries = get_audit_log()
     for e in entries:
         body = {k: v for k, v in e.items() if k != "entry_hash"}
@@ -452,11 +503,6 @@ def verify_audit_chain():
 
 
 def get_audit_log_for(username, role):
-    """Role-scoped view of the audit log:
-      - admin:    every event, from every user
-      - manager:  events logged by/about engineers only
-      - engineer: only their own events
-    """
     entries = get_audit_log()
     if role == "admin":
         return entries

@@ -28,8 +28,6 @@ st.markdown("""
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
 <style>
     .main .block-container { padding-top: 1.2rem; padding-bottom: 2rem; }
-
-    /* ---------- Global card / metric polish ---------- */
     .stMetric {
         background-color: #0f172a;
         border: 1px solid #1e293b;
@@ -46,97 +44,47 @@ st.markdown("""
         color: white;
         font-weight: 600;
     }
-
-    /* ---------- Role badges ---------- */
     .user-badge-admin {
-        background: linear-gradient(135deg, #8b5cf6, #6d28d9);
-        color: white; padding: 3px 10px;
-        border-radius: 999px; font-size: 0.72rem; font-weight: 700;
-        letter-spacing: 0.02em;
+        background-color: #8b5cf6; color: white; padding: 2px 8px;
+        border-radius: 12px; font-size: 0.7rem; font-weight: 600;
     }
     .user-badge-manager {
-        background: linear-gradient(135deg, #f59e0b, #d97706);
-        color: white; padding: 3px 10px;
-        border-radius: 999px; font-size: 0.72rem; font-weight: 700;
-        letter-spacing: 0.02em;
+        background-color: #f59e0b; color: white; padding: 2px 8px;
+        border-radius: 12px; font-size: 0.7rem; font-weight: 600;
     }
     .user-badge-engineer {
-        background: linear-gradient(135deg, #3b82f6, #2563eb);
-        color: white; padding: 3px 10px;
-        border-radius: 999px; font-size: 0.72rem; font-weight: 700;
-        letter-spacing: 0.02em;
+        background-color: #3b82f6; color: white; padding: 2px 8px;
+        border-radius: 12px; font-size: 0.7rem; font-weight: 600;
     }
-    .fa-icon { margin-right: 8px; }
-
-    /* ---------- Header: welcome banner ---------- */
-    .app-header {
-        display: flex; align-items: center; justify-content: space-between;
-        flex-wrap: wrap; gap: 12px;
-        background: linear-gradient(120deg, #0b1220 0%, #101a30 55%, #0f2942 100%);
-        border: 1px solid rgba(56, 189, 248, 0.22);
-        border-radius: 20px;
-        padding: 20px 26px;
-        margin-bottom: 16px;
-        box-shadow: 0 20px 45px rgba(2, 6, 23, 0.35), inset 0 1px 0 rgba(255,255,255,0.03);
-        position: relative;
-        overflow: hidden;
+    .welcome-banner {
+        background: linear-gradient(135deg, rgba(15, 23, 42, 0.96) 0%, rgba(30, 41, 59, 0.94) 100%);
+        border: 1px solid rgba(56, 189, 248, 0.16); border-radius: 18px;
+        padding: 16px 18px; margin-bottom: 12px;
+        box-shadow: 0 18px 40px rgba(2, 6, 23, 0.22);
     }
-    .app-header::before {
-        content: "";
-        position: absolute; top: -60%; right: -10%;
-        width: 260px; height: 260px; border-radius: 50%;
-        background: radial-gradient(circle, rgba(56,189,248,0.20), transparent 70%);
-        pointer-events: none;
+    .fa-icon {
+        margin-right: 8px;
     }
-    .app-header-left { display: flex; align-items: center; gap: 14px; z-index: 1; }
-    .app-header-avatar {
-        width: 46px; height: 46px; border-radius: 14px;
-        background: linear-gradient(135deg, #38bdf8, #0ea5e9);
-        display: flex; align-items: center; justify-content: center;
-        font-size: 1.3rem; color: #04121f; font-weight: 800;
-        box-shadow: 0 8px 18px rgba(56,189,248,0.35);
-    }
-    .app-header-greeting { font-size: 1.05rem; color: #f8fafc; font-weight: 600; margin: 0; }
-    .app-header-sub { font-size: 0.78rem; color: #94a3b8; margin-top: 2px; }
-    .app-header-right { display: flex; align-items: center; gap: 10px; z-index: 1; }
-
-    /* ---------- Header: snapshot / calendar banner ---------- */
     .calendar-banner {
-        background: linear-gradient(120deg, rgba(15, 23, 42, 0.97) 0%, rgba(15, 40, 64, 0.9) 100%);
-        border: 1px solid rgba(56, 189, 248, 0.20);
-        border-radius: 16px;
-        padding: 14px 18px; margin-bottom: 14px;
-        box-shadow: 0 12px 28px rgba(2, 6, 23, 0.2);
-        display: flex; align-items: center; gap: 10px;
+        background: linear-gradient(135deg, rgba(15, 23, 42, 0.95) 0%, rgba(30, 41, 59, 0.9) 100%);
+        border: 1px solid rgba(56, 189, 248, 0.16); border-radius: 18px;
+        padding: 14px 16px; margin-bottom: 12px;
+        box-shadow: 0 14px 32px rgba(2, 6, 23, 0.18);
     }
-    .calendar-banner strong { color: #f8fafc; font-size: 0.95rem; }
-    .calendar-banner .calendar-subtitle { color: #94a3b8; font-size: 0.8rem; margin-top: 2px; }
-    .calendar-icon-wrap {
-        width: 34px; height: 34px; border-radius: 10px;
-        background: rgba(56,189,248,0.14); color: #38bdf8;
-        display: flex; align-items: center; justify-content: center; font-size: 1rem;
-        flex-shrink: 0;
+    .calendar-banner strong {
+        color: #f8fafc;
+        font-size: 0.98rem;
     }
-
+    .calendar-banner .calendar-subtitle {
+        color: #94a3b8;
+        font-size: 0.82rem;
+        margin-top: 2px;
+    }
     .negative-report-card {
         background: rgba(15, 23, 42, 0.72);
         border: 1px solid rgba(248, 113, 113, 0.22);
         border-radius: 16px;
         padding: 10px 14px;
-    }
-
-    /* ---------- Processing status card ---------- */
-    div[data-testid="stStatusWidget"] {
-        border-radius: 14px !important;
-        border: 1px solid rgba(56,189,248,0.18) !important;
-    }
-
-    /* ---------- Filter form panel (PV String Details) ---------- */
-    div[data-testid="stForm"] {
-        background: rgba(15, 23, 42, 0.55);
-        border: 1px solid rgba(148, 163, 184, 0.15);
-        border-radius: 16px;
-        padding: 16px 18px 6px 18px;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -398,38 +346,18 @@ def process_scada_excel_bytes(file_bytes, filename_hash=None):
 
 
 def process_scada_excel_with_status(file_bytes, filename_hash=None, source_label="SCADA workbook"):
-    """Run the cached parser behind a polished, step-by-step Streamlit status card."""
-    steps = [
-        ("📖", "Reading workbook", "Opening the file and detecting sheet structure..."),
-        ("🧭", "Mapping identifiers", "Extracting Plot / Block / SACU from inverter IDs..."),
-        ("⚡", "Calculating metrics", "Computing working/failed string counts and availability..."),
-        ("💾", "Saving snapshot", "Persisting the processed snapshot for dashboards & history..."),
-    ]
+    """Run the cached parser behind a richer Streamlit status container."""
+    status = st.status(f"Processing {source_label}", expanded=True)
+    status.write("Reading the workbook and detecting sheet structure...")
+    status.write("Calculating plot, block, SACU, and string metrics...")
 
-    with st.status(f"Processing **{source_label}**", expanded=True) as status:
-        progress = st.progress(0, text=f"{steps[0][0]}  {steps[0][1]}...")
-        status.write(f"{steps[0][0]} **{steps[0][1]}** — {steps[0][2]}")
-        progress.progress(20, text=f"{steps[1][0]}  {steps[1][1]}...")
-        status.write(f"{steps[1][0]} **{steps[1][1]}** — {steps[1][2]}")
-        progress.progress(55, text=f"{steps[2][0]}  {steps[2][1]}...")
-        status.write(f"{steps[2][0]} **{steps[2][1]}** — {steps[2][2]}")
+    processed_dfs = process_scada_excel_bytes(file_bytes, filename_hash=filename_hash)
 
-        processed_dfs = process_scada_excel_bytes(file_bytes, filename_hash=filename_hash)
-
-        progress.progress(85, text=f"{steps[3][0]}  {steps[3][1]}...")
-        status.write(f"{steps[3][0]} **{steps[3][1]}** — {steps[3][2]}")
-
-        if processed_dfs:
-            progress.progress(100, text="Done")
-            sheet_count = len(processed_dfs)
-            row_count = sum(len(d) for d in processed_dfs.values())
-            status.update(
-                label=f"✅ {source_label} processed — {sheet_count} sheet(s), {row_count:,} row(s)",
-                state="complete", expanded=False,
-            )
-        else:
-            progress.progress(100, text="Failed")
-            status.update(label=f"❌ Could not process {source_label}", state="error", expanded=True)
+    if processed_dfs:
+        status.write("Saving the processed snapshot for dashboards and comparisons...")
+        status.update(label=f"{source_label} processed successfully", state="complete", expanded=False)
+    else:
+        status.update(label=f"Could not process {source_label}", state="error", expanded=False)
 
     return processed_dfs
 
@@ -581,20 +509,13 @@ def display_negative_pv_values(df_result, sheet_name="Sheet1"):
     )
 
 # ==========================================
-# 6. UI - USER MANAGEMENT
+# 6. UI - USER MANAGEMENT (unchanged)
 # ==========================================
 def user_management_ui():
     """
     admin   -> create/delete any user, change roles, assign plots, full access
     manager -> create engineer users only, CANNOT delete anyone, can assign plots
     engineer-> no access (menu not shown)
-
-    NOTE ON ICONS: st.button / st.expander / st.selectbox labels render as
-    PLAIN TEXT in Streamlit (there is no unsafe_allow_html for widget
-    labels), so Font Awesome <i> tags never actually rendered here - they
-    just showed up as literal text. Those labels now use plain text/emoji
-    instead. Font Awesome is still used everywhere via st.markdown, which
-    does support it.
     """
     current_user = get_current_user()
     if not current_user:
@@ -604,14 +525,14 @@ def user_management_ui():
         return
 
     st.sidebar.markdown("---")
-    st.sidebar.markdown('<i class="fas fa-users"></i> <b>User Management</b>', unsafe_allow_html=True)
+    st.sidebar.markdown('<i class="fas fa-users"></i> User Management', unsafe_allow_html=True)
 
     users = storage1.load_users()
     allowed_roles = storage1.creatable_roles(role)
 
-    with st.sidebar.expander("👥 Manage Users", expanded=False):
+    with st.sidebar.expander('<i class="fas fa-user-cog"></i> Manage Users', expanded=False):
         # ---- Create user ----
-        st.write("### ➕ Create New User")
+        st.write("### Create New User")
         new_full_name = st.text_input("Full Name", key="new_user_fullname")
         new_username = st.text_input("Username", key="new_user")
         new_password = st.text_input("Password", type="password", key="new_pass")
@@ -619,7 +540,7 @@ def user_management_ui():
         default_plots = storage1.ALL_PLOTS if new_role in ("admin", "manager") else storage1.ALL_PLOTS[:3]
         new_plots = st.multiselect("Assign Plots", storage1.ALL_PLOTS, default=default_plots, key="new_user_plots")
 
-        if st.button("➕ Create User", key="create_user_btn", use_container_width=True):
+        if st.button('<i class="fas fa-user-plus"></i> Create User', key="create_user_btn"):
             ok, msg = storage1.create_user(
                 username=new_username, password=new_password, role=new_role,
                 full_name=new_full_name, assigned_plots=new_plots,
@@ -634,7 +555,7 @@ def user_management_ui():
                 st.error(msg)
 
         # ---- Existing users ----
-        st.write("### 📋 Existing Users")
+        st.write("### Existing Users")
         for username, user_data in users.items():
             if username == current_user.get("username"):
                 continue
@@ -647,7 +568,7 @@ def user_management_ui():
                 st.write(f"**{user_data.get('full_name', username)}** (`{username}` - {user_data['role']})")
             with col2:
                 if storage1.can_delete_users(role):
-                    if st.button("🗑️", key=f"del_{username}", help="Delete this user"):
+                    if st.button('<i class="fas fa-trash"></i>', key=f"del_{username}"):
                         storage1.delete_user(username)
                         storage1.log_audit_event(current_user["username"], role, "user_deleted",
                                                  {"deleted_user": username})
@@ -656,12 +577,12 @@ def user_management_ui():
                     st.caption("no delete")
             with col3:
                 if storage1.can_assign_plots(role) and user_data["role"] in ("engineer", "manager"):
-                    if st.button("✏️", key=f"assign_{username}", help="Assign plots"):
+                    if st.button('<i class="fas fa-pen"></i>', key=f"assign_{username}"):
                         st.session_state.assign_user = username
                         st.rerun()
             with col4:
                 if storage1.can_reset_password_for(role, user_data["role"]):
-                    if st.button("🔑", key=f"resetpwd_{username}", help="Reset password"):
+                    if st.button('<i class="fas fa-key"></i>', key=f"resetpwd_{username}"):
                         st.session_state.reset_pwd_user = username
                         st.rerun()
 
@@ -670,7 +591,7 @@ def user_management_ui():
             target_username = st.session_state.reset_pwd_user
             target_data = users.get(target_username)
             if target_data and storage1.can_reset_password_for(role, target_data["role"]):
-                st.write(f"### 🔑 Reset Password for {target_data.get('full_name', target_username)}")
+                st.write(f"### Reset Password for {target_data.get('full_name', target_username)}")
                 admin_new_pw = st.text_input("New Password", type="password", key="admin_reset_pw_1")
                 admin_new_pw_confirm = st.text_input("Confirm New Password", type="password", key="admin_reset_pw_2")
                 if st.button("Confirm Reset", key="admin_reset_pw_confirm_btn"):
@@ -697,7 +618,7 @@ def user_management_ui():
             username = st.session_state.assign_user
             user_data = users.get(username)
             if user_data:
-                st.write(f"### ✏️ Assign Plots for {user_data.get('full_name', username)}")
+                st.write(f"### Assign Plots for {user_data.get('full_name', username)}")
                 assigned = user_data.get("assigned_plots", [])
                 selected_plots = st.multiselect(
                     f"Select plots for {username}", options=storage1.ALL_PLOTS, default=assigned,
@@ -714,122 +635,41 @@ def user_management_ui():
                     del st.session_state.assign_user
                     st.rerun()
 
-    # ---- Super-admin-only panel ----
+    # ---- Super-admin-only: user-data backup / restore ----
+    # app.py updates can wipe data/users.json, so the super admin can pull
+    # a JSON backup down, and later push it back up to refill ONLY whatever
+    # accounts are missing (existing accounts are never overwritten).
     if storage1.is_super_admin(current_user.get("username")):
-        render_super_admin_panel(current_user, role)
+        with st.sidebar.expander('<i class="fas fa-database"></i> User Data Backup (Super Admin)', expanded=False):
+            st.caption("Restricted to the super admin account. Backs up login/user records so they survive app updates.")
 
+            backup_bytes = storage1.export_users_backup()
+            st.download_button(
+                label="Download Backup",
+                data=backup_bytes,
+                file_name=f"users_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                mime="application/json",
+                key="download_users_backup_btn",
+                use_container_width=True,
+                on_click=_log_download, args=("users_backup",),
+            )
 
-def render_super_admin_panel(current_user, role):
-    """
-    Super-admin-only sidebar panel:
-      - export/download a fresh login-data backup
-      - restore missing users from an uploaded backup
-      - browse, download, and delete server-side saved backup snapshots
-      - danger zone: reset ALL application data except user accounts
-    """
-    with st.sidebar.expander("🛡️ Super Admin Panel", expanded=False):
-        st.caption("Restricted to the super admin account. Backs up login/user records so they survive app updates.")
-
-        backup_bytes = storage1.export_users_backup()
-        st.download_button(
-            label="⬇️ Download New Backup",
-            data=backup_bytes,
-            file_name=f"users_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
-            mime="application/json",
-            key="download_users_backup_btn",
-            use_container_width=True,
-            on_click=_log_download, args=("users_backup",),
-        )
-
-        st.markdown("**♻️ Restore Missing Users**")
-        st.caption("Only usernames absent from the current system are added back. Existing accounts are left untouched.")
-        backup_upload = st.file_uploader("Upload backup file (.json)", type=["json"], key="users_backup_upload")
-        if backup_upload is not None:
-            if st.button("Restore Missing Users", key="restore_users_backup_btn", use_container_width=True):
-                ok, msg, restored = storage1.import_users_backup(backup_upload.getvalue())
-                if ok:
-                    storage1.log_audit_event(
-                        current_user["username"], role, "users_backup_restored",
-                        {"restored_users": restored},
-                    )
-                    st.success(msg)
-                    if restored:
-                        st.rerun()
-                else:
-                    st.error(msg)
-
-        st.markdown("---")
-        st.markdown("**📦 Manage Saved Backups**")
-        saved_backups = storage1.list_user_backups()
-        if not saved_backups:
-            st.caption("No server-side backup snapshots yet. Download a backup above to create one.")
-        else:
-            st.caption(f"{len(saved_backups)} snapshot(s) stored on the server.")
-            for b in saved_backups:
-                bcol1, bcol2, bcol3 = st.columns([3, 1, 1])
-                with bcol1:
-                    st.write(f"`{b['filename']}`")
-                    st.caption(f"{b['created']} · {b['size_kb']} KB · {b.get('user_count', '?')} users")
-                with bcol2:
-                    backup_data = storage1.get_user_backup_bytes(b["filename"])
-                    if backup_data:
-                        st.download_button(
-                            "⬇️", data=backup_data, file_name=b["filename"], mime="application/json",
-                            key=f"dl_backup_{b['filename']}", help="Download this snapshot",
+            st.markdown("**Restore Missing Users**")
+            st.caption("Only usernames absent from the current system are added back. Existing accounts are left untouched.")
+            backup_upload = st.file_uploader("Upload backup file (.json)", type=["json"], key="users_backup_upload")
+            if backup_upload is not None:
+                if st.button("Restore Missing Users", key="restore_users_backup_btn", use_container_width=True):
+                    ok, msg, restored = storage1.import_users_backup(backup_upload.getvalue())
+                    if ok:
+                        storage1.log_audit_event(
+                            current_user["username"], role, "users_backup_restored",
+                            {"restored_users": restored},
                         )
-                with bcol3:
-                    if st.button("🗑️", key=f"del_backup_{b['filename']}", help="Delete this snapshot"):
-                        ok, msg = storage1.delete_user_backup(b["filename"])
-                        storage1.log_audit_event(current_user["username"], role, "backup_deleted", {"filename": b["filename"]})
-                        if ok:
-                            st.success(msg)
-                        else:
-                            st.error(msg)
-                        st.rerun()
-
-            if st.button("🗑️ Delete ALL Saved Backups", key="delete_all_backups_btn", use_container_width=True):
-                st.session_state.confirm_delete_all_backups = True
-                st.rerun()
-
-            if st.session_state.get("confirm_delete_all_backups"):
-                st.warning("This will permanently delete every saved backup snapshot. This cannot be undone.")
-                cc1, cc2 = st.columns(2)
-                with cc1:
-                    if st.button("Yes, delete all", key="confirm_delete_all_backups_yes", use_container_width=True):
-                        ok, msg = storage1.delete_all_user_backups()
-                        storage1.log_audit_event(current_user["username"], role, "all_backups_deleted", {})
                         st.success(msg)
-                        del st.session_state.confirm_delete_all_backups
-                        st.rerun()
-                with cc2:
-                    if st.button("Cancel", key="confirm_delete_all_backups_no", use_container_width=True):
-                        del st.session_state.confirm_delete_all_backups
-                        st.rerun()
-
-        st.markdown("---")
-        st.markdown(
-            "<div style='background:#7f1d1d; border:1px solid #ef4444; border-radius:10px; padding:10px 12px;'>"
-            "<strong style='color:#fecaca;'>⚠️ Danger Zone — Reset Application</strong>"
-            "<div style='color:#fecaca; font-size:0.82rem; margin-top:4px;'>"
-            "Wipes ALL uploaded SCADA workbooks, preprocessed snapshots, and the audit log. "
-            "<b>User accounts &amp; passwords are NEVER touched</b> by this action.</div></div>",
-            unsafe_allow_html=True,
-        )
-        reset_confirm_text = st.text_input(
-            "Type RESET to confirm", key="reset_app_confirm_text",
-            placeholder="Type RESET to enable the button below",
-        )
-        reset_disabled = reset_confirm_text.strip().upper() != "RESET"
-        if st.button("🧨 Reset Application Data", key="reset_app_data_btn",
-                     use_container_width=True, disabled=reset_disabled, type="primary"):
-            ok, msg, details = storage1.reset_application_data()
-            storage1.log_audit_event(current_user["username"], role, "application_reset", details)
-            if ok:
-                st.success(msg)
-            else:
-                st.error(msg)
-            del st.session_state["reset_app_confirm_text"]
-            st.rerun()
+                        if restored:
+                            st.rerun()
+                    else:
+                        st.error(msg)
 
 def audit_log_tab():
     """Role-scoped audit log, shown in its own dashboard tab"""
@@ -913,78 +753,58 @@ def get_filter_options_cached(df, column):
         return sorted_filter_options(df[column])
     return []
 
-# Cache summary metrics calculation with hash - fully vectorized (no iterrows).
-# The previous per-row `.iterrows()` loop was the main reason the PV String
-# Details tab felt slow: every filter change re-ran that loop over the whole
-# (filtered) sheet. Vectorized pandas ops give the same output far faster.
+# Cache summary metrics calculation with hash
 @st.cache_data(ttl=300, hash_funcs={pd.DataFrame: lambda df: df.shape[0]})
 def calculate_summary_metrics_cached(filtered_df, inverter_col, pv_voltage_cols, pv_current_cols):
-    """Vectorized summary metrics calculation."""
-    if filtered_df.empty:
-        return pd.DataFrame()
+    """Cache the summary metrics calculation"""
+    summary_metrics = []
 
-    df = filtered_df.copy()
-    n = len(df)
+    for idx, row in filtered_df.iterrows():
+        inverter_id = row[inverter_col]
+        plot = row.get("Plot", "")
+        block = row.get("Block", "")
+        sacu = row.get("SACU", "")
 
-    has_precomputed = "Total Active Strings" in df.columns and "Working String Count" in df.columns
-
-    if has_precomputed:
-        total_strings = pd.to_numeric(df["Total Active Strings"], errors="coerce").fillna(0).astype(int)
-        working_strings = pd.to_numeric(df["Working String Count"], errors="coerce").fillna(0).astype(int)
-        failed_strings = pd.to_numeric(
-            df.get("Failed String Count", total_strings - working_strings), errors="coerce"
-        ).fillna(0).astype(int)
-        availability = pd.to_numeric(df.get("Availability (%)"), errors="coerce").fillna(0)
-    else:
-        present_current_cols = [c for c in pv_current_cols if c in df.columns]
-        if present_current_cols:
-            numeric_currents = df[present_current_cols].apply(pd.to_numeric, errors="coerce")
-            total_strings = numeric_currents.notna().sum(axis=1)
-            working_strings = (numeric_currents > WORKING_CURRENT_THRESHOLD).sum(axis=1)
+        if "Total Active Strings" in row and "Working String Count" in row:
+            total_strings = int(row["Total Active Strings"]) if pd.notna(row["Total Active Strings"]) else 0
+            working_strings = int(row["Working String Count"]) if pd.notna(row["Working String Count"]) else 0
+            failed_strings = int(row["Failed String Count"]) if pd.notna(row["Failed String Count"]) else 0
+            availability = row["Availability (%)"] if pd.notna(row["Availability (%)"]) else 0
         else:
-            total_strings = pd.Series(0, index=df.index)
-            working_strings = pd.Series(0, index=df.index)
-        failed_strings = (total_strings - working_strings).clip(lower=0)
-        availability = (working_strings / total_strings.replace(0, pd.NA) * 100).fillna(0)
+            total_strings, working_strings, failed_strings = 0, 0, 0
+            for col in pv_current_cols:
+                if col in row and pd.notna(row[col]):
+                    total_strings += 1
+                    if row[col] > WORKING_CURRENT_THRESHOLD:
+                        working_strings += 1
+                    else:
+                        failed_strings += 1
+            availability = (working_strings / total_strings * 100) if total_strings > 0 else 0
 
-    present_voltage_cols = [c for c in pv_voltage_cols if c in df.columns]
-    if present_voltage_cols:
-        numeric_voltage = df[present_voltage_cols].apply(pd.to_numeric, errors="coerce")
-        avg_voltage = numeric_voltage.mean(axis=1).fillna(0)
-    else:
-        avg_voltage = pd.Series(0.0, index=df.index)
+        grid = row.get("Grid", "")
+        e_daily = row.get("E-Daily(KWH)", "")
+        active_power = row.get("Active Power", "")
+        reactive_power = row.get("Reactive Power", "")
 
-    present_current_cols_avg = [c for c in pv_current_cols if c in df.columns]
-    if present_current_cols_avg:
-        numeric_current_avg = df[present_current_cols_avg].apply(pd.to_numeric, errors="coerce")
-        avg_current = numeric_current_avg.mean(axis=1).fillna(0)
-    else:
-        avg_current = pd.Series(0.0, index=df.index)
+        voltage_values = [row[col] for col in pv_voltage_cols if col in row and pd.notna(row[col])]
+        avg_voltage = sum(voltage_values) / len(voltage_values) if voltage_values else 0
 
-    health_status = pd.cut(
-        availability, bins=[-0.1, 50, 70, 90, 100.1],
-        labels=["Poor", "Fair", "Good", "Excellent"],
-    ).astype(str)
+        current_values = [row[col] for col in pv_current_cols if col in row and pd.notna(row[col])]
+        avg_current = sum(current_values) / len(current_values) if current_values else 0
 
-    summary_df = pd.DataFrame({
-        "Inverter ID": df[inverter_col].values if inverter_col in df.columns else [""] * n,
-        "Plot": df.get("Plot", pd.Series([""] * n)).values,
-        "Block": df.get("Block", pd.Series([""] * n)).values,
-        "SACU": df.get("SACU", pd.Series([""] * n)).values,
-        "Total Strings": total_strings.values,
-        "Working Strings": working_strings.values,
-        "Failed Strings": failed_strings.values,
-        "Availability (%)": availability.round(2).values,
-        "Health Status": health_status.values,
-        "Avg PV Voltage (V)": avg_voltage.round(1).values,
-        "Avg PV Current (A)": avg_current.round(2).values,
-        "Grid": df.get("Grid", pd.Series([""] * n)).values,
-        "E-Daily (KWH)": df.get("E-Daily(KWH)", pd.Series([""] * n)).values,
-        "Active Power (KW)": df.get("Active Power", pd.Series([""] * n)).values,
-        "Reactive Power (KVAR)": df.get("Reactive Power", pd.Series([""] * n)).values,
-    })
+        health_status = "Excellent" if availability >= 90 else "Good" if availability >= 70 else "Fair" if availability >= 50 else "Poor"
 
-    return summary_df
+        summary_metrics.append({
+            "Inverter ID": inverter_id, "Plot": plot, "Block": block, "SACU": sacu,
+            "Total Strings": total_strings, "Working Strings": working_strings,
+            "Failed Strings": failed_strings, "Availability (%)": round(availability, 2),
+            "Health Status": health_status, "Avg PV Voltage (V)": round(avg_voltage, 1),
+            "Avg PV Current (A)": round(avg_current, 2), "Grid": grid,
+            "E-Daily (KWH)": e_daily, "Active Power (KW)": active_power,
+            "Reactive Power (KVAR)": reactive_power
+        })
+
+    return pd.DataFrame(summary_metrics)
 
 # Cache the filtered dataframe with hash
 @st.cache_data(ttl=60, hash_funcs={pd.DataFrame: lambda df: df.shape[0]})
@@ -1065,117 +885,102 @@ def create_pv_string_tab(df):
         return
 
     # ==========================================
-    # FILTERS SECTION - batched behind a "Search" button.
-    #
-    # Previously every dropdown change re-triggered filtering + the summary
-    # calculation immediately, and each dropdown's options were re-derived
-    # from the *previous* dropdown's selection (a 4-way cascade), so a
-    # single click could cascade into several expensive reruns. Now:
-    #   - dropdown options are computed once from the whole sheet (fast,
-    #     cached), not chained through prior selections
-    #   - nothing is (re)computed until "Search" is clicked
+    # FILTERS SECTION - Using cached options and session state
     # ==========================================
 
+    # Initialize session state for filters if not exists
     if "pv_filters" not in st.session_state:
         st.session_state.pv_filters = {
-            "plot": "All", "block": "All", "sacu": "All", "inverter": "All",
-            "grid": "All", "status": "All", "show_voltage": False, "show_current": True,
+            "plot": "All",
+            "block": "All",
+            "sacu": "All",
+            "inverter": "All",
+            "grid": "All",
+            "status": "All",
+            "show_voltage": False,
+            "show_current": True
         }
 
-    available_plots = get_filter_options_cached(df, "Plot")
-    available_blocks = get_filter_options_cached(df, "Block")
-    available_sacus = get_filter_options_cached(df, "SACU")
-    available_inverters = get_filter_options_cached(df, inverter_col)
-    available_grids = get_filter_options_cached(df, "Grid") if "Grid" in df.columns else []
-    status_options = ["All", "Working (>=70%)", "Fair (50-70%)", "Failed (<50%)", "Critical (<30%)"]
-
-    with st.form(key="pv_filters_form", border=True):
-        st.markdown(
-            "<div style='font-size:0.85rem; color:#94a3b8; margin-bottom:4px;'>"
-            "<i class='fas fa-filter'></i> Set your filters, then click <b>Search</b> to apply.</div>",
-            unsafe_allow_html=True,
+    # Row 1: Plot, Block, SACU, Inverter, Show Options
+    col1, col2, col3, col4, col5 = st.columns(5)
+    with col1:
+        available_plots = get_filter_options_cached(df, "Plot")
+        selected_plot = st.selectbox(
+            "Filter by Plot",
+            ["All"] + available_plots,
+            key="pv_plot_filter",
+            index=0 if st.session_state.pv_filters["plot"] == "All" else (["All"] + available_plots).index(st.session_state.pv_filters["plot"]) if st.session_state.pv_filters["plot"] in available_plots else 0
         )
-        col1, col2, col3, col4, col5 = st.columns(5)
-        with col1:
-            plot_choices = ["All"] + available_plots
-            selected_plot = st.selectbox(
-                "Plot", plot_choices,
-                index=plot_choices.index(st.session_state.pv_filters["plot"]) if st.session_state.pv_filters["plot"] in plot_choices else 0,
-                key="pv_plot_filter",
-            )
-        with col2:
-            block_choices = ["All"] + available_blocks
-            selected_block = st.selectbox(
-                "Block", block_choices,
-                index=block_choices.index(st.session_state.pv_filters["block"]) if st.session_state.pv_filters["block"] in block_choices else 0,
-                key="pv_block_filter",
-            )
-        with col3:
-            sacu_choices = ["All"] + available_sacus
-            selected_sacu = st.selectbox(
-                "SACU", sacu_choices,
-                index=sacu_choices.index(st.session_state.pv_filters["sacu"]) if st.session_state.pv_filters["sacu"] in sacu_choices else 0,
-                key="pv_sacu_filter",
-            )
-        with col4:
-            inverter_choices = ["All"] + available_inverters
-            selected_inverter = st.selectbox(
-                "Inverter", inverter_choices,
-                index=inverter_choices.index(st.session_state.pv_filters["inverter"]) if st.session_state.pv_filters["inverter"] in inverter_choices else 0,
-                key="pv_inverter_filter",
-            )
-        with col5:
-            show_voltage = st.checkbox("Show Voltage", value=st.session_state.pv_filters["show_voltage"], key="show_voltage")
-            show_current = st.checkbox("Show Current", value=st.session_state.pv_filters["show_current"], key="show_current")
+        st.session_state.pv_filters["plot"] = selected_plot
 
-        col6, col7, col8 = st.columns([2, 2, 1])
-        with col6:
-            grid_choices = ["All"] + available_grids
-            selected_grid = st.selectbox(
-                "Grid", grid_choices,
-                index=grid_choices.index(st.session_state.pv_filters["grid"]) if st.session_state.pv_filters["grid"] in grid_choices else 0,
-                key="pv_grid_filter",
-            )
-        with col7:
-            selected_status = st.selectbox(
-                "Status", status_options,
-                index=status_options.index(st.session_state.pv_filters["status"]) if st.session_state.pv_filters["status"] in status_options else 0,
-                key="pv_status_filter",
-            )
-        with col8:
-            st.write("")
-            search_clicked = st.form_submit_button("🔍 Search", use_container_width=True, type="primary")
+    with col2:
+        filtered_by_plot = df if selected_plot == "All" else df[df["Plot"] == selected_plot]
+        available_blocks = get_filter_options_cached(filtered_by_plot, "Block")
+        selected_block = st.selectbox(
+            "Filter by Block",
+            ["All"] + available_blocks,
+            key="pv_block_filter",
+            index=0 if st.session_state.pv_filters["block"] == "All" else (["All"] + available_blocks).index(st.session_state.pv_filters["block"]) if st.session_state.pv_filters["block"] in available_blocks else 0
+        )
+        st.session_state.pv_filters["block"] = selected_block
 
-    if search_clicked:
-        st.session_state.pv_filters.update({
-            "plot": selected_plot, "block": selected_block, "sacu": selected_sacu,
-            "inverter": selected_inverter, "grid": selected_grid, "status": selected_status,
-            "show_voltage": show_voltage, "show_current": show_current,
-        })
+    with col3:
+        filtered_by_block = filtered_by_plot if selected_block == "All" else filtered_by_plot[filtered_by_plot["Block"] == selected_block]
+        available_sacus = get_filter_options_cached(filtered_by_block, "SACU")
+        selected_sacu = st.selectbox(
+            "Filter by SACU",
+            ["All"] + available_sacus,
+            key="pv_sacu_filter",
+            index=0 if st.session_state.pv_filters["sacu"] == "All" else (["All"] + available_sacus).index(st.session_state.pv_filters["sacu"]) if st.session_state.pv_filters["sacu"] in available_sacus else 0
+        )
+        st.session_state.pv_filters["sacu"] = selected_sacu
 
-    active_filters = st.session_state.pv_filters
-    selected_plot = active_filters["plot"]
-    selected_block = active_filters["block"]
-    selected_sacu = active_filters["sacu"]
-    selected_inverter = active_filters["inverter"]
-    selected_grid = active_filters["grid"]
-    selected_status = active_filters["status"]
-    show_voltage = active_filters["show_voltage"]
-    show_current = active_filters["show_current"]
+    with col4:
+        filtered_by_sacu = filtered_by_block if selected_sacu == "All" else filtered_by_block[filtered_by_block["SACU"] == selected_sacu]
+        available_inverters = get_filter_options_cached(filtered_by_sacu, inverter_col)
+        selected_inverter = st.selectbox(
+            "Filter by Inverter",
+            ["All"] + available_inverters,
+            key="pv_inverter_filter",
+            index=0 if st.session_state.pv_filters["inverter"] == "All" else (["All"] + available_inverters).index(st.session_state.pv_filters["inverter"]) if st.session_state.pv_filters["inverter"] in available_inverters else 0
+        )
+        st.session_state.pv_filters["inverter"] = selected_inverter
 
-    active_chips = [f"{label}: {value}" for label, value in
-                    [("Plot", selected_plot), ("Block", selected_block), ("SACU", selected_sacu),
-                     ("Inverter", selected_inverter), ("Grid", selected_grid), ("Status", selected_status)]
-                    if value != "All"]
-    if active_chips:
-        st.caption("🔎 Active filters — " + " · ".join(active_chips))
-    else:
-        st.caption("No filters applied — showing all data. Set filters above and click Search to narrow the view.")
+    with col5:
+        show_voltage = st.checkbox("Show Voltage", value=st.session_state.pv_filters["show_voltage"], key="show_voltage")
+        show_current = st.checkbox("Show Current", value=st.session_state.pv_filters["show_current"], key="show_current")
+        st.session_state.pv_filters["show_voltage"] = show_voltage
+        st.session_state.pv_filters["show_current"] = show_current
+
+    # Row 2: Grid Filter and Working Status Filter
+    col6, col7, col8 = st.columns([2, 2, 1])
+    with col6:
+        available_grids = get_filter_options_cached(df, "Grid") if "Grid" in df.columns else []
+        selected_grid = st.selectbox(
+            "Filter by Grid",
+            ["All"] + available_grids,
+            key="pv_grid_filter",
+            index=0 if st.session_state.pv_filters["grid"] == "All" else (["All"] + available_grids).index(st.session_state.pv_filters["grid"]) if st.session_state.pv_filters["grid"] in available_grids else 0
+        )
+        st.session_state.pv_filters["grid"] = selected_grid
+
+    with col7:
+        status_options = ["All", "Working (>=70%)", "Fair (50-70%)", "Failed (<50%)", "Critical (<30%)"]
+        selected_status = st.selectbox(
+            "Filter by Status",
+            status_options,
+            key="pv_status_filter",
+            index=0 if st.session_state.pv_filters["status"] == "All" else status_options.index(st.session_state.pv_filters["status"]) if st.session_state.pv_filters["status"] in status_options else 0
+        )
+        st.session_state.pv_filters["status"] = selected_status
+
+    with col8:
+        st.write("")
 
     # Apply filters with caching
     filter_key = f"{selected_plot}_{selected_block}_{selected_sacu}_{selected_inverter}_{selected_grid}_{selected_status}"
 
-    if "filtered_df_cache" not in st.session_state or st.session_state.get("filter_key") != filter_key:
+    if "filtered_df_cache" not in st.session_state or st.session_state.filter_key != filter_key:
         st.session_state.filtered_df = apply_filters_cached(
             df, selected_plot, selected_block, selected_sacu, selected_inverter,
             selected_grid, selected_status, inverter_col
@@ -1193,7 +998,7 @@ def create_pv_string_tab(df):
     # ==========================================
     summary_key = f"{filter_key}_{len(filtered_df)}"
 
-    if "summary_df_cache" not in st.session_state or st.session_state.get("summary_key") != summary_key:
+    if "summary_df_cache" not in st.session_state or st.session_state.summary_key != summary_key:
         st.session_state.summary_df = calculate_summary_metrics_cached(
             filtered_df, inverter_col, pv_voltage_cols, pv_current_cols
         )
@@ -2010,11 +1815,8 @@ def render_header_calendar():
     st.markdown(
         f"""
         <div class="calendar-banner">
-            <div class="calendar-icon-wrap"><i class="fas fa-calendar-days"></i></div>
-            <div>
-                <strong>Snapshot Date</strong>
-                <div class="calendar-subtitle">Browse any previously preprocessed snapshot without re-uploading.</div>
-            </div>
+            <strong><i class="fas fa-calendar-days" style="color:#38bdf8; margin-right:8px;"></i>Snapshot Date</strong>
+            <div class="calendar-subtitle">Browse any previously preprocessed snapshot without re-uploading.</div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -2080,28 +1882,19 @@ def main():
 
     role = current_user["role"]
     full_name = current_user.get("full_name", current_user["username"])
-    avatar_initial = (full_name or current_user["username"])[0].upper()
 
-    # ---- Header: greeting + role badge, redesigned as a proper header bar ----
+    # ---- Welcome banner / greeting ----
     st.markdown(f"""
-    <div class="app-header">
-        <div class="app-header-left">
-            <div class="app-header-avatar">{avatar_initial}</div>
-            <div>
-                <p class="app-header-greeting">👋 Hi, {full_name}</p>
-                <div class="app-header-sub">Solar PV String Analytics · welcome back</div>
-            </div>
-        </div>
-        <div class="app-header-right">
-            <span class="user-badge-{role}">{ROLE_BADGES.get(role, role)}</span>
-        </div>
+    <div class="welcome-banner">
+        <span style="font-size:1.15rem;"><i class="fas fa-hand-sparkles" style="color:#fbbf24;"></i> Hi, <b>{full_name}</b>!</span>
+        &nbsp;&nbsp;<span class="user-badge-{role}">{ROLE_BADGES.get(role, role)}</span>
     </div>
     """, unsafe_allow_html=True)
 
     # ---- Sidebar ----
     st.sidebar.markdown('<h2><i class="fas fa-bolt" style="color:#38bdf8;"></i> PV String Template</h2>', unsafe_allow_html=True)
 
-    with st.sidebar.expander("👤 My Profile", expanded=False):
+    with st.sidebar.expander("My Profile", expanded=False):
         st.write(f"**Full Name:** {full_name}")
         st.write(f"**Username:** {current_user['username']}")
         st.write(f"**Role:** {ROLE_BADGES.get(role, role)}", unsafe_allow_html=True)
@@ -2124,7 +1917,7 @@ def main():
 
     st.sidebar.markdown(f"**User:** {current_user['username']} ({ROLE_BADGES.get(role, role)})", unsafe_allow_html=True)
 
-    if st.sidebar.button("🚪 Logout", use_container_width=True):
+    if st.sidebar.button("Logout"):
         storage1.log_audit_event(current_user["username"], role, "logout", {})
         st.session_state.authenticated = False
         st.session_state.user = None
@@ -2133,7 +1926,7 @@ def main():
     st.sidebar.markdown("---")
 
     # ---- File upload (admin only) ----
-    st.sidebar.subheader("📁 File Management")
+    st.sidebar.subheader("File Management")
 
     if is_admin():
         latest_upload = storage1.get_latest_upload()
@@ -2214,7 +2007,7 @@ def main():
             df_selected = df_selected[df_selected["Plot"].isin(allowed_plots)]
 
     st.sidebar.markdown("---")
-    st.sidebar.subheader("🔎 Filters")
+    st.sidebar.subheader("Filters")
 
     # Initialize sidebar filters in session state
     if "sidebar_filters" not in st.session_state:

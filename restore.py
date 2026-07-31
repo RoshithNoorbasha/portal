@@ -2,30 +2,23 @@
 restore.py
 ==========
 Restore & TAT Analysis Module for PV SCADA Analytics.
-
-Changes vs the previous version:
-- No longer keeps its own snapshot folder / metadata file. It reads
-  snapshots straight from storage.py's single upload registry, which is
-  the same registry app.py writes to when the admin uploads a workbook.
-  -> one JSON file, one place to look, easy to keep in sync.
-- The old "pick exactly 3 dates" comparison is replaced with a calendar
-  (From Date -> To Date) comparison: pick a date range, and the tool
-  automatically compares the first vs last snapshot in that range and
-  plots the trend across every snapshot that falls inside the range.
-- Per-string failure/restoration TAT tracking (string_history.json) is
-  unchanged - it is already calendar/date-range aware.
+Optimized with caching, session-backed pagination, and a trimmed set of
+tabs focused on: registry health, a fast 3-day summary, a full string
+history matrix, working hours reference, and calendar comparison.
 """
 
 import json
 from datetime import datetime, timedelta
 from pathlib import Path
+import hashlib
+import re
 
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
-import storage
+import storage1
 
 # ==========================================
 # CONFIGURATION
@@ -34,6 +27,7 @@ WORKING_HOURS_START = 6
 WORKING_HOURS_END = 18
 WORKING_HOURS_PER_DAY = WORKING_HOURS_END - WORKING_HOURS_START
 WORKING_CURRENT_THRESHOLD = 0.5
+DEFAULT_TOTAL_ACTIVE_STRINGS = 19
 
 DATA_DIR = Path("data")
 HISTORY_FILE = DATA_DIR / "string_history.json"
@@ -43,6 +37,74 @@ INVERTER_ID_COLS = [
     "Inverter ID", "Inverter_ID", "Inverter", "ID",
     "Device Name", "String Inverter", "Inverters",
 ]
+
+# Active string overrides matching app.py
+ACTIVE_STRING_OVERRIDES = {
+    "P2": {"IB1": 18, "IB3": 17, "IB4": 18, "IB5": 18},
+    "P6": {"IB1": 18, "IB2": 18, "IB3": 18, "IB5": 18, "IB6": 18, "IB7": 18},
+}
+
+# Cache TTL in seconds
+CACHE_TTL = 300  # 5 minutes
+CACHE_LONG_TTL = 3600  # 1 hour
+
+DEFAULT_PAGE_SIZE = 25
+
+
+def sorted_filter_options(series):
+    """Return non-null unique values sorted safely for Streamlit filters."""
+    values = [value for value in series.dropna().unique()]
+
+    def natural_key(value):
+        text = str(value).strip()
+        return tuple(
+            (0, int(part)) if part.isdigit() else (1, part.casefold())
+            for part in re.split(r"(\d+)", text)
+        )
+
+    return sorted(values, key=natural_key)
+
+
+# ==========================================
+# PAGINATION HELPER (session-state backed, so switching tabs/filters
+# doesn't reset your place, and large tables never render in one shot)
+# ==========================================
+def paginate_dataframe(df, page_size=DEFAULT_PAGE_SIZE, key_prefix="pg"):
+    """Slice a dataframe into pages using session_state, with Prev/Next
+    controls and a direct page-number jump. Returns the current page slice."""
+    total_rows = len(df)
+    if total_rows == 0:
+        st.caption("No rows to display.")
+        return df
+
+    total_pages = max(1, (total_rows - 1) // page_size + 1)
+    page_key = f"{key_prefix}_page"
+
+    if page_key not in st.session_state:
+        st.session_state[page_key] = 1
+    # Clamp in case the filtered result shrank since the last run
+    st.session_state[page_key] = max(1, min(st.session_state[page_key], total_pages))
+
+    nav_col1, nav_col2, nav_col3 = st.columns([1, 2, 1])
+    with nav_col1:
+        if st.button("Previous", key=f"{key_prefix}_prev_btn",
+                     disabled=st.session_state[page_key] <= 1, use_container_width=True):
+            st.session_state[page_key] -= 1
+    with nav_col3:
+        if st.button("Next", key=f"{key_prefix}_next_btn",
+                     disabled=st.session_state[page_key] >= total_pages, use_container_width=True):
+            st.session_state[page_key] += 1
+    with nav_col2:
+        st.number_input(
+            "Page", min_value=1, max_value=total_pages,
+            key=page_key, step=1, label_visibility="collapsed",
+        )
+
+    page = st.session_state[page_key]
+    start = (page - 1) * page_size
+    end = start + page_size
+    st.caption(f"Rows {start + 1}-{min(end, total_rows)} of {total_rows} - Page {page}/{total_pages}")
+    return df.iloc[start:end]
 
 
 # ==========================================
@@ -55,7 +117,9 @@ def can_upload(user_role: str) -> bool:
 # ==========================================
 # STRING HISTORY MANAGEMENT (per-string TAT tracking)
 # ==========================================
-def load_string_history():
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
+def load_string_history_cached():
+    """Cached version of load_string_history for better performance."""
     if HISTORY_FILE.exists():
         try:
             with open(HISTORY_FILE, "r", encoding="utf-8") as f:
@@ -68,11 +132,19 @@ def load_string_history():
     return {"strings": {}, "last_updated": None}
 
 
+def load_string_history():
+    """Load string history with caching."""
+    return load_string_history_cached()
+
+
 def save_string_history(history):
+    """Save string history and invalidate cache."""
     history.setdefault("strings", {})
     history["last_updated"] = datetime.now().isoformat()
     with open(HISTORY_FILE, "w", encoding="utf-8") as f:
         json.dump(history, f, indent=2)
+    # Clear cache after save
+    load_string_history_cached.clear()
 
 
 def init_history():
@@ -81,6 +153,8 @@ def init_history():
 
 
 def get_inverter_column(df: pd.DataFrame):
+    if df is None or df.empty:
+        return None
     df_columns_lower_map = {str(c).strip().lower(): c for c in df.columns}
     for col in INVERTER_ID_COLS:
         if col in df.columns:
@@ -103,6 +177,15 @@ def get_pv_current_columns(df: pd.DataFrame):
     return sorted(pv_cols, key=sort_key)
 
 
+def get_total_active_strings(plot, block):
+    """Get total active strings for a plot/block combination."""
+    plot_key = str(plot).strip().upper() if plot else ""
+    block_key = str(block).strip().upper() if block else ""
+    if plot_key in ACTIVE_STRING_OVERRIDES and block_key in ACTIVE_STRING_OVERRIDES[plot_key]:
+        return ACTIVE_STRING_OVERRIDES[plot_key][block_key]
+    return DEFAULT_TOTAL_ACTIVE_STRINGS
+
+
 def update_string_history(df, date_str):
     """Update per-string status history with a given day's data."""
     if df is None or df.empty:
@@ -117,13 +200,38 @@ def update_string_history(df, date_str):
     if not pv_current_cols:
         return
 
+    # Get total active strings per inverter
+    df = df.copy()
+    df["Total_Active"] = df.apply(
+        lambda row: get_total_active_strings(row.get("Plot"), row.get("Block")), axis=1
+    )
+
     for _, row in df.iterrows():
         inverter_id = str(row[inverter_col])
-        history["strings"].setdefault(inverter_id, {})
+        total_active = int(row.get("Total_Active", DEFAULT_TOTAL_ACTIVE_STRINGS))
 
-        for col in pv_current_cols:
-            string_id = str(col)
+        history["strings"].setdefault(inverter_id, {})
+        history["strings"][inverter_id].setdefault("_metadata", {
+            "plot": str(row.get("Plot", "")),
+            "block": str(row.get("Block", "")),
+            "sacu": str(row.get("SACU", "")),
+            "total_active": total_active,
+        })
+
+        # Track all PV-I columns, but mark beyond total_active as "open"
+        for i, col in enumerate(pv_current_cols, 1):
+            string_id = f"PV-I{i}"
             current_value = pd.to_numeric(row.get(col), errors="coerce")
+
+            # Determine status: working, failed, or open (no data)
+            if i > total_active:
+                status = "open"
+            elif pd.isna(current_value):
+                status = "open"
+            elif current_value > WORKING_CURRENT_THRESHOLD:
+                status = "working"
+            else:
+                status = "failed"
 
             if string_id not in history["strings"][inverter_id]:
                 history["strings"][inverter_id][string_id] = {
@@ -132,7 +240,6 @@ def update_string_history(df, date_str):
                     "last_change": None,
                 }
 
-            status = "working" if pd.notna(current_value) and current_value > WORKING_CURRENT_THRESHOLD else "failed"
             status_history = history["strings"][inverter_id][string_id]["status_history"]
             last_record = status_history[-1] if status_history else None
 
@@ -156,91 +263,284 @@ def update_string_history(df, date_str):
 
 
 # ==========================================
-# SNAPSHOT ACCESS (delegates to storage.py)
+# SNAPSHOT ACCESS (delegates to storage1.py)
 # ==========================================
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
+def get_available_snapshot_dates_cached():
+    """Cached version of get_available_snapshot_dates."""
+    return storage1.get_available_snapshot_dates()
+
+
 def get_available_snapshot_dates():
-    return storage.get_available_snapshot_dates()
+    """Get available snapshot dates with caching."""
+    return get_available_snapshot_dates_cached()
+
+
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
+def load_snapshot_sheet_cached(snapshot_date, sheet_name):
+    """Cached version of load_snapshot_sheet."""
+    entry = storage1.get_upload_for_date(snapshot_date)
+    if not entry:
+        return None
+    return storage1.load_sheet_csv(entry["upload_id"], sheet_name)
 
 
 def load_snapshot_sheet(snapshot_date, sheet_name):
-    entry = storage.get_upload_for_date(snapshot_date)
-    if not entry:
-        return None
-    return storage.load_sheet_csv(entry["upload_id"], sheet_name)
+    """Load snapshot sheet with caching."""
+    return load_snapshot_sheet_cached(snapshot_date, sheet_name)
+
+
+def get_snapshots_in_range(from_date, to_date):
+    """Get all snapshot dates in the given range."""
+    available = get_available_snapshot_dates()
+    from_str, to_str = str(from_date), str(to_date)
+    return [d for d in available if from_str <= d <= to_str]
 
 
 # ==========================================
-# TAT & RESTORE CALCULATIONS (per-string, arbitrary date range)
+# BLOCK -> INVERTER -> STRING HISTORY MATRIX (day-wise)
 # ==========================================
-def calculate_failure_to_restore_tat(history, inverter_id, string_id, date_start=None, date_end=None):
-    """Calculate failure -> restore TAT events for one string within an
-    optional [date_start, date_end] calendar window."""
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
+def build_full_string_matrix_cached(history_hash, plot, block, sacu, inverter,
+                                     date_start_str, date_end_str, max_dates):
+    """
+    Cached builder for the full Block -> Inverter -> String status matrix,
+    one row per string, one column per calendar date. Built once per unique
+    (filters + history-content) combination instead of per inverter, so
+    switching pages/filters doesn't re-walk the whole history each time.
+    """
+    history = load_string_history()
     strings = history.get("strings", {})
-    if inverter_id not in strings or string_id not in strings[inverter_id]:
-        return []
 
-    status_history = strings[inverter_id][string_id].get("status_history", [])
-    if len(status_history) < 2:
-        return []
+    date_start = date_start_str  # already "YYYY-MM-DD" strings, compare lexicographically
+    date_end = date_end_str
 
-    events = []
-    last_failure_time = None
+    rows = []
+    dates_set = set()
 
-    for record in status_history:
-        status = record.get("status", "")
-        date = record.get("date", "")
-        time_str = record.get("time", "00:00:00")
+    for inv_id, inv_data in strings.items():
+        if inv_id.startswith("_"):
+            continue
+        metadata = inv_data.get("_metadata", {})
+        p = metadata.get("plot", "")
+        b = metadata.get("block", "")
+        s = metadata.get("sacu", "")
 
-        try:
-            event_time = datetime.strptime(f"{date} {time_str}", "%Y-%m-%d %H:%M:%S")
-        except Exception:
-            try:
-                event_time = datetime.strptime(f"{date} 00:00:00", "%Y-%m-%d")
-            except Exception:
+        if plot and plot != "All" and p != plot:
+            continue
+        if block and block != "All" and b != block:
+            continue
+        if sacu and sacu != "All" and s != sacu:
+            continue
+        if inverter and inverter != "All" and inv_id != inverter:
+            continue
+
+        for string_id, sdata in inv_data.items():
+            if string_id.startswith("_"):
                 continue
+            status_history = sdata.get("status_history", [])
+            row_statuses = {}
+            for record in status_history:
+                d = record.get("date", "")
+                if date_start and d < date_start:
+                    continue
+                if date_end and d > date_end:
+                    continue
+                row_statuses[d] = record.get("status", "unknown")
+                dates_set.add(d)
 
-        if date_start and event_time.date() < date_start:
+            if row_statuses:
+                rows.append({
+                    "Plot": p, "Block": b, "SACU": s,
+                    "Inverter": inv_id, "String": string_id,
+                    **row_statuses,
+                })
+
+    dates_sorted = sorted(dates_set)
+    if max_dates and len(dates_sorted) > max_dates:
+        dates_sorted = dates_sorted[-max_dates:]  # keep the most recent N dates
+
+    if not rows:
+        return pd.DataFrame(), dates_sorted
+
+    df = pd.DataFrame(rows)
+    for d in dates_sorted:
+        if d not in df.columns:
+            df[d] = "unknown"
+
+    ordered_cols = ["Plot", "Block", "SACU", "Inverter", "String"] + dates_sorted
+    ordered_cols = [c for c in ordered_cols if c in df.columns]
+    df = df[ordered_cols].fillna("unknown")
+    df = df.sort_values(["Plot", "Block", "Inverter", "String"]).reset_index(drop=True)
+    return df, dates_sorted
+
+
+def build_full_string_matrix(plot="All", block="All", sacu="All", inverter="All",
+                              date_start=None, date_end=None, max_dates=30):
+    """Wrapper that hashes the current history so the cached builder above
+    only re-runs when the underlying data (or filters) actually change."""
+    history = load_string_history()
+    history_hash = hashlib.md5(json.dumps(history, sort_keys=True).encode()).hexdigest()
+    date_start_str = date_start.strftime("%Y-%m-%d") if date_start else None
+    date_end_str = date_end.strftime("%Y-%m-%d") if date_end else None
+    return build_full_string_matrix_cached(
+        history_hash, plot, block, sacu, inverter, date_start_str, date_end_str, max_dates
+    )
+
+
+def display_string_history_matrix(history, current_df):
+    """Block -> Inverter -> String status matrix, one column per date."""
+    st.subheader("String History Matrix")
+    st.caption(
+        "Every string's day-wise status, grouped by Block and Inverter. "
+        "Green = Working, Red = Failed, Gray = Open/NA, Slate = Unknown."
+    )
+
+    if not history.get("strings"):
+        st.info("No string history available yet. Upload SCADA data first.")
+        return
+
+    inverter_data = []
+    for inv_id, inv_data in history["strings"].items():
+        if inv_id.startswith("_"):
             continue
-        if date_end and event_time.date() > date_end:
-            continue
-
-        if status == "failed" and last_failure_time is None:
-            last_failure_time = event_time
-        elif status == "working" and last_failure_time is not None:
-            restore_time = event_time
-            total_minutes = 0
-            current_time = last_failure_time
-            while current_time < restore_time:
-                if WORKING_HOURS_START <= current_time.hour < WORKING_HOURS_END:
-                    total_minutes += 60
-                current_time += timedelta(minutes=60)
-
-            events.append({
-                "failure_date": last_failure_time.strftime("%Y-%m-%d %H:%M:%S"),
-                "restore_date": restore_time.strftime("%Y-%m-%d %H:%M:%S"),
-                "tat_working_hours": round(total_minutes / 60, 2),
-                "tat_actual_hours": round((restore_time - last_failure_time).total_seconds() / 3600, 2),
-                "status": "restored",
-            })
-            last_failure_time = None
-
-    if last_failure_time is not None:
-        events.append({
-            "failure_date": last_failure_time.strftime("%Y-%m-%d %H:%M:%S"),
-            "restore_date": "Not restored yet",
-            "tat_working_hours": "Ongoing",
-            "tat_actual_hours": "Ongoing",
-            "status": "ongoing_failure",
+        metadata = inv_data.get("_metadata", {})
+        inverter_data.append({
+            "inverter": inv_id,
+            "plot": metadata.get("plot", ""),
+            "block": metadata.get("block", ""),
+            "sacu": metadata.get("sacu", ""),
         })
 
-    return events
+    if not inverter_data:
+        st.info("No inverters found in history.")
+        return
+
+    df_inverters = pd.DataFrame(inverter_data)
+
+    # ---- Filters ----
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        plots = ["All"] + sorted_filter_options(df_inverters["plot"])
+        selected_plot = st.selectbox("Plot", plots, key="matrix_plot")
+
+    filtered_inverters = df_inverters.copy()
+    if selected_plot != "All":
+        filtered_inverters = filtered_inverters[filtered_inverters["plot"] == selected_plot]
+
+    with col2:
+        blocks = ["All"] + sorted_filter_options(filtered_inverters["block"])
+        selected_block = st.selectbox("Block", blocks, key="matrix_block")
+
+    if selected_block != "All":
+        filtered_inverters = filtered_inverters[filtered_inverters["block"] == selected_block]
+
+    with col3:
+        sacus = ["All"] + sorted_filter_options(filtered_inverters["sacu"])
+        selected_sacu = st.selectbox("SACU", sacus, key="matrix_sacu")
+
+    if selected_sacu != "All":
+        filtered_inverters = filtered_inverters[filtered_inverters["sacu"] == selected_sacu]
+
+    with col4:
+        inverters = ["All"] + sorted_filter_options(filtered_inverters["inverter"])
+        selected_inverter = st.selectbox("Inverter", inverters, key="matrix_inverter")
+
+    col5, col6, col7 = st.columns(3)
+    with col5:
+        available_dates = get_available_snapshot_dates()
+        if available_dates:
+            min_date = datetime.strptime(available_dates[0], "%Y-%m-%d").date()
+            max_date = datetime.strptime(available_dates[-1], "%Y-%m-%d").date()
+            date_range = st.date_input(
+                "Date Range", value=(min_date, max_date),
+                min_value=min_date, max_value=max_date, key="matrix_date_range",
+            )
+        else:
+            date_range = (None, None)
+    with col6:
+        max_dates_shown = st.slider("Most recent dates to show", min_value=5, max_value=60, value=30, key="matrix_max_dates")
+    with col7:
+        page_size = st.selectbox("Rows per page", [15, 25, 50, 100], index=1, key="matrix_page_size")
+
+    date_start, date_end = None, None
+    if isinstance(date_range, (list, tuple)) and len(date_range) == 2:
+        date_start, date_end = date_range
+
+    with st.spinner("Building string history matrix..."):
+        df_matrix, dates_sorted = build_full_string_matrix(
+            plot=selected_plot, block=selected_block, sacu=selected_sacu,
+            inverter=selected_inverter, date_start=date_start, date_end=date_end,
+            max_dates=max_dates_shown,
+        )
+
+    if df_matrix.empty:
+        st.info("No matrix data available for the selected filters.")
+        return
+
+    total_strings = len(df_matrix)
+    total_inverters_shown = df_matrix["Inverter"].nunique()
+    total_blocks_shown = df_matrix["Block"].nunique()
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Strings", total_strings)
+    m2.metric("Inverters", total_inverters_shown)
+    m3.metric("Blocks", total_blocks_shown)
+    m4.metric("Dates Shown", len(dates_sorted))
+
+    st.markdown("---")
+
+    page_df = paginate_dataframe(df_matrix, page_size=page_size, key_prefix="matrix")
+
+    def color_status(val):
+        if val == "working":
+            return "background-color: #10b981; color: white; text-align: center; font-weight: bold;"
+        elif val == "failed":
+            return "background-color: #ef4444; color: white; text-align: center; font-weight: bold;"
+        elif val == "open":
+            return "background-color: #94a3b8; color: white; text-align: center;"
+        else:
+            return "background-color: #64748b; color: white; text-align: center;"
+
+    try:
+        styled_page = page_df.style.map(color_status, subset=dates_sorted)
+        st.dataframe(styled_page, use_container_width=True, height=520)
+    except Exception:
+        st.dataframe(page_df, use_container_width=True, height=520)
+
+    # Full-window (unpaginated) summary stats, computed once on the whole matrix
+    if dates_sorted:
+        total_cells = total_strings * len(dates_sorted)
+        working_cells = int((df_matrix[dates_sorted] == "working").sum().sum())
+        failed_cells = int((df_matrix[dates_sorted] == "failed").sum().sum())
+        open_cells = int((df_matrix[dates_sorted] == "open").sum().sum())
+        unknown_cells = total_cells - working_cells - failed_cells - open_cells
+
+        st.markdown("---")
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("Total Cells", f"{total_cells:,}")
+        c2.metric("Working", f"{working_cells:,} ({working_cells / total_cells * 100:.1f}%)" if total_cells else "0")
+        c3.metric("Failed", f"{failed_cells:,} ({failed_cells / total_cells * 100:.1f}%)" if total_cells else "0")
+        c4.metric("Open/NA", f"{open_cells:,} ({open_cells / total_cells * 100:.1f}%)" if total_cells else "0")
+        c5.metric("Unknown", f"{unknown_cells:,} ({unknown_cells / total_cells * 100:.1f}%)" if total_cells else "0")
+
+    csv_matrix = df_matrix.to_csv(index=False)
+    st.download_button(
+        "Download Full Matrix (CSV)", data=csv_matrix,
+        file_name=f"string_history_matrix_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+        mime="text/csv", key="matrix_download_btn",
+    )
 
 
 # ==========================================
-# CALENDAR (FROM DATE -> TO DATE) COMPARISON
+# SNAPSHOT-TO-SNAPSHOT COMPARISON (powers both the 3-day Summary
+# Dashboard and the Calendar Compare tab)
 # ==========================================
-def compare_two_snapshots_by_date(old_date, new_date, sheet_name="Sheet1"):
-    """Compare exactly two calendar snapshots (baseline vs latest)."""
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
+def compare_two_snapshots_by_date_cached(old_date, new_date, sheet_name="Sheet1"):
+    """Cached version of compare_two_snapshots_by_date. Diffs every PV-I
+    string between two saved snapshots directly (not the JSON history file),
+    so it's accurate even for dates that predate string_history.json."""
     df_old = load_snapshot_sheet(old_date, sheet_name)
     df_new = load_snapshot_sheet(new_date, sheet_name)
 
@@ -258,7 +558,7 @@ def compare_two_snapshots_by_date(old_date, new_date, sheet_name="Sheet1"):
     for name, df in [("Baseline", df_old), ("Latest", df_new)]:
         missing = [c for c in required_cols if c not in df.columns]
         if missing:
-            return None, f"{name} snapshot ({old_date if name=='Baseline' else new_date}) is missing columns: {missing}"
+            return None, f"{name} snapshot ({old_date if name == 'Baseline' else new_date}) is missing columns: {missing}"
 
     op_hours = WORKING_HOURS_PER_DAY
 
@@ -286,6 +586,10 @@ def compare_two_snapshots_by_date(old_date, new_date, sheet_name="Sheet1"):
 
     results = []
     for _, row in merged_df.iterrows():
+        plot = row.get("Plot", "")
+        block = row.get("Block", "")
+        total_active = get_total_active_strings(plot, block)
+
         data = {
             "Plot": row["Plot"],
             "Block": row["Block"],
@@ -294,30 +598,42 @@ def compare_two_snapshots_by_date(old_date, new_date, sheet_name="Sheet1"):
             "Working_to_Failed": 0,
             "Current_Failure_Hours": 0,
             "Restoration_TAT_Hours": 0,
+            "Restored_Strings": [],
+            "Newly_Failed_Strings": [],
         }
-        for i in range(1, 29):
+
+        for i in range(1, total_active + 1):
             pv_col_name = f"PV-I{i}"
             if pv_col_name not in pv_cols:
                 continue
 
-            is_active_old = i <= row["Total Active Strings_old"]
-            is_active_new = i <= row["Total Active Strings_new"]
+            pv_old = row.get(f"{pv_col_name}_old", 0)
+            pv_new = row.get(f"{pv_col_name}_new", 0)
 
-            pv_old = row[f"{pv_col_name}_old"]
-            pv_new = row[f"{pv_col_name}_new"]
+            old_valid = pd.notna(pv_old) and pv_old > 0
+            new_valid = pd.notna(pv_new) and pv_new > 0
 
-            is_working_old = is_active_old and (pv_old > WORKING_CURRENT_THRESHOLD)
-            is_working_new = is_active_new and (pv_new > WORKING_CURRENT_THRESHOLD)
+            is_working_old = old_valid and pv_old > WORKING_CURRENT_THRESHOLD
+            is_working_new = new_valid and pv_new > WORKING_CURRENT_THRESHOLD
 
-            if not is_working_old and is_working_new:
-                data["Failed_to_Working"] += 1
-                data["Restoration_TAT_Hours"] += op_hours
-            elif is_working_old and not is_working_new:
+            if old_valid and new_valid:
+                if not is_working_old and is_working_new:
+                    data["Failed_to_Working"] += 1
+                    data["Restoration_TAT_Hours"] += op_hours
+                    data["Restored_Strings"].append(pv_col_name)
+                elif is_working_old and not is_working_new:
+                    data["Working_to_Failed"] += 1
+                    data["Current_Failure_Hours"] += op_hours
+                    data["Newly_Failed_Strings"].append(pv_col_name)
+                elif not is_working_old and not is_working_new:
+                    data["Current_Failure_Hours"] += op_hours
+            elif old_valid and not new_valid:
                 data["Working_to_Failed"] += 1
                 data["Current_Failure_Hours"] += op_hours
-            elif not is_working_old and not is_working_new:
-                data["Current_Failure_Hours"] += op_hours
+                data["Newly_Failed_Strings"].append(pv_col_name)
 
+        data["Restored_Strings"] = ", ".join(data["Restored_Strings"])
+        data["Newly_Failed_Strings"] = ", ".join(data["Newly_Failed_Strings"])
         results.append(data)
 
     df_history = pd.DataFrame(results)
@@ -334,17 +650,22 @@ def compare_two_snapshots_by_date(old_date, new_date, sheet_name="Sheet1"):
 
     return {
         "df_history": df_history,
+        "inverter_col": inverter_col,
         "baseline_avg_working_current": baseline_avg_working_current,
         "operational_hours": op_hours,
     }, None
 
 
-def build_range_trend_data(from_date, to_date, sheet_name="Sheet1"):
-    """Build a long-form Date/Plot/Block trend dataframe for every snapshot
-    that falls inside [from_date, to_date] (inclusive), using the metrics
-    already computed at upload time (Working/Failed/Total Active Strings)."""
+def compare_two_snapshots_by_date(old_date, new_date, sheet_name="Sheet1"):
+    """Compare two snapshots with caching."""
+    return compare_two_snapshots_by_date_cached(old_date, new_date, sheet_name)
+
+
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
+def build_range_trend_data_cached(from_date, to_date, sheet_name="Sheet1"):
+    """Cached version of build_range_trend_data."""
     from_str, to_str = str(from_date), str(to_date)
-    dates_in_range = [d for d in storage.get_available_snapshot_dates() if from_str <= d <= to_str]
+    dates_in_range = [d for d in storage1.get_available_snapshot_dates() if from_str <= d <= to_str]
 
     rows = []
     for d in sorted(dates_in_range):
@@ -369,22 +690,30 @@ def build_range_trend_data(from_date, to_date, sheet_name="Sheet1"):
     return pd.concat(rows, ignore_index=True)
 
 
+def build_range_trend_data(from_date, to_date, sheet_name="Sheet1"):
+    """Build trend data with caching."""
+    return build_range_trend_data_cached(from_date, to_date, sheet_name)
+
+
 # ==========================================
-# UI - UPLOAD REGISTRY (read-only, admin uploads happen from the main app sidebar)
+# UI FUNCTIONS
 # ==========================================
 def display_upload_registry(user_role, upload_handler=None):
-    st.subheader("📤 Snapshot Upload Registry")
+    """Upload registry + a health check confirming every entry's files
+    actually exist on disk (catches redeploys/volume resets that leave a
+    registry entry with nothing backing it)."""
+    st.subheader("Snapshot Upload Registry")
     st.caption(
         "SCADA workbooks are uploaded from the main sidebar (admin only) and "
         "automatically saved here, day-wise, so they can be compared later."
     )
 
     if can_upload(user_role) and upload_handler:
-        with st.expander("⬆️ Backfill a Previous Date's Snapshot", expanded=False):
+        with st.expander("Backfill a Previous Date's Snapshot", expanded=False):
             st.caption(
                 "Upload a SCADA workbook for any past calendar date. It will be "
                 "processed and stored exactly as if it had been uploaded that day, "
-                "so it's available for history, TAT and calendar-comparison."
+                "so it's available for history and calendar-comparison."
             )
             backfill_date = st.date_input(
                 "Snapshot Date", value=datetime.now().date(),
@@ -401,219 +730,247 @@ def display_upload_registry(user_role, upload_handler=None):
                 else:
                     st.error(msg)
 
-    uploads = storage.get_all_uploads()
+    uploads = storage1.get_all_uploads()
     if not uploads:
         st.info("No snapshots uploaded yet.")
         return
 
-    df_uploads = pd.DataFrame(uploads)[
-        ["snapshot_date", "original_filename", "uploaded_by", "upload_timestamp", "saved_sheets"]
+    # ---- Registry health check: does every entry's on-disk data still exist? ----
+    with st.spinner("Checking registry integrity..."):
+        report = storage1.get_upload_registry_report()
+
+    ok_count = sum(1 for r in report if r["integrity_ok"])
+    broken_count = len(report) - ok_count
+
+    h1, h2, h3 = st.columns(3)
+    h1.metric("Registered Uploads", len(report))
+    h2.metric("Healthy", ok_count)
+    h3.metric("Broken / Missing Files", broken_count)
+
+    if broken_count > 0:
+        st.error(
+            f"{broken_count} registry entr{'y is' if broken_count == 1 else 'ies are'} missing their backing "
+            f"file(s) on disk (likely from a deploy without a persistent volume). Re-upload the affected date(s)."
+        )
+    else:
+        st.success("Upload registry is healthy - every entry's files are present on disk.")
+
+    df_report = pd.DataFrame(report)[
+        ["snapshot_date", "original_filename", "uploaded_by", "upload_timestamp",
+         "saved_sheets", "integrity_ok", "integrity_message"]
     ].sort_values("snapshot_date", ascending=False)
-    df_uploads.columns = ["Snapshot Date", "File Name", "Uploaded By", "Upload Time", "Sheets Saved"]
-    st.dataframe(df_uploads, use_container_width=True)
+    df_report.columns = ["Snapshot Date", "File Name", "Uploaded By", "Upload Time",
+                          "Sheets Saved", "Files OK", "Integrity Detail"]
+
+    def color_integrity(val):
+        if val is True:
+            return "background-color: #10b981; color: white; font-weight: bold;"
+        if val is False:
+            return "background-color: #ef4444; color: white; font-weight: bold;"
+        return ""
+
+    st.dataframe(
+        df_report.style.map(color_integrity, subset=["Files OK"]),
+        use_container_width=True,
+    )
 
 
-# ==========================================
-# UI - SUMMARY & ANALYSIS
-# ==========================================
-def display_summary_dashboard(history, current_df):
-    st.subheader("📊 Summary Dashboard")
+def display_summary_dashboard(sheet_name="Sheet1"):
+    """
+    Last-3-days summary: per-day inverter/string/working/failed counts,
+    plus day-over-day restored vs newly-failed string counts (with the
+    specific strings that restored) and supporting graphs.
+    """
+    st.subheader("Summary Dashboard - Last 3 Days")
+    st.caption("Inverter and string counts for the most recent snapshots, with day-over-day restored/failed comparison.")
 
-    if not history.get("strings"):
-        st.info("No string history available. Please upload SCADA data first.")
+    available_dates = get_available_snapshot_dates()
+    if not available_dates:
+        st.info("No snapshot data available yet. Upload a SCADA workbook to get started.")
         return
 
-    total_inverters = len(history["strings"])
-    total_strings = 0
-    total_failures = 0
-    total_restorations = 0
-    all_failures = []
+    last_dates = sorted(available_dates)[-3:]  # oldest -> newest, up to 3
 
-    for inverter_id, strings in history["strings"].items():
-        for string_id, data in strings.items():
-            total_strings += 1
-            status_history = data.get("status_history", [])
-            for i in range(1, len(status_history)):
-                prev_status = status_history[i - 1].get("status")
-                curr_status = status_history[i].get("status")
-                if curr_status == "failed" and prev_status == "working":
-                    total_failures += 1
-                    all_failures.append({
-                        "inverter": inverter_id,
-                        "string": string_id,
-                        "date": status_history[i].get("date", ""),
-                    })
-                elif curr_status == "working" and prev_status == "failed":
-                    total_restorations += 1
+    # ---- Per-day counts ----
+    daily_summaries = []
+    with st.spinner("Loading recent snapshots..."):
+        for d in last_dates:
+            df = load_snapshot_sheet(d, sheet_name)
+            if df is None or df.empty:
+                daily_summaries.append({
+                    "Date": d, "Inverters": 0, "Total Strings": 0,
+                    "Working": 0, "Failed": 0, "Availability (%)": 0.0,
+                })
+                continue
+            inverter_col = get_inverter_column(df)
+            total_inverters = df[inverter_col].nunique() if inverter_col else 0
+            total_strings = int(df["Total Active Strings"].sum()) if "Total Active Strings" in df.columns else 0
+            working = int(df["Working String Count"].sum()) if "Working String Count" in df.columns else 0
+            failed = int(df["Failed String Count"].sum()) if "Failed String Count" in df.columns else 0
+            availability = round((working / total_strings * 100), 2) if total_strings else 0.0
+            daily_summaries.append({
+                "Date": d, "Inverters": total_inverters, "Total Strings": total_strings,
+                "Working": working, "Failed": failed, "Availability (%)": availability,
+            })
 
-    col1, col2, col3, col4, col5 = st.columns(5)
-    col1.metric("Total Inverters", total_inverters)
-    col2.metric("Total Strings", total_strings)
-    col3.metric("Total Failures", total_failures)
-    col4.metric("Total Restorations", total_restorations)
+    df_daily = pd.DataFrame(daily_summaries)
 
-    if current_df is not None and not current_df.empty:
-        total_active = current_df["Total Active Strings"].sum() if "Total Active Strings" in current_df.columns else 0
-        working = current_df["Working String Count"].sum() if "Working String Count" in current_df.columns else 0
-        availability = (working / total_active * 100) if total_active > 0 else 0
-        col5.metric("Current Availability", f"{availability:.1f}%")
+    st.markdown("#### Daily Snapshot Counts")
+    day_cols = st.columns(len(df_daily))
+    for idx, row in df_daily.iterrows():
+        with day_cols[idx]:
+            st.metric(row["Date"], f"{row['Availability (%)']:.1f}% avail")
+            st.caption(f"Inverters: {row['Inverters']:,} | Total Strings: {row['Total Strings']:,}")
+            st.write(f"Working: **{row['Working']:,}**  ·  Failed: **{row['Failed']:,}**")
 
+    st.dataframe(df_daily, use_container_width=True)
+
+    fig_daily = go.Figure()
+    fig_daily.add_trace(go.Bar(x=df_daily["Date"], y=df_daily["Working"], name="Working", marker_color="#10b981"))
+    fig_daily.add_trace(go.Bar(x=df_daily["Date"], y=df_daily["Failed"], name="Failed", marker_color="#ef4444"))
+    fig_daily.update_layout(barmode="group", title="Working vs Failed Strings (Last 3 Days)",
+                             height=380, plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)")
+    st.plotly_chart(fig_daily, use_container_width=True, key="summary_daily_bar")
+
+    if len(last_dates) < 2:
+        st.info("Need at least 2 snapshot dates to calculate restored/failed comparisons.")
+        return
+
+    # ---- Day-over-day restored / failed comparison ----
     st.markdown("---")
+    st.markdown("#### Day-over-Day Restored / Failed Comparison")
 
-    if all_failures:
-        df_failures = pd.DataFrame(all_failures)
-        df_failures["date"] = pd.to_datetime(df_failures["date"], errors="coerce")
-        daily_failures = df_failures.groupby(df_failures["date"].dt.date).size().reset_index(name="failures")
-        fig = px.bar(daily_failures, x="date", y="failures", title="Daily Failure Count",
-                     labels={"date": "Date", "failures": "Number of Failures"})
-        fig.update_layout(height=400)
-        st.plotly_chart(fig, use_container_width=True)
+    comparison_rows = []
+    restored_detail_frames = []
+    failed_detail_frames = []
 
-    status_counts = {"working": 0, "failed": 0}
-    if current_df is not None and not current_df.empty:
-        status_counts["working"] = int(current_df["Working String Count"].sum()) if "Working String Count" in current_df.columns else 0
-        status_counts["failed"] = int(current_df["Failed String Count"].sum()) if "Failed String Count" in current_df.columns else 0
+    with st.spinner("Comparing consecutive snapshots..."):
+        for i in range(1, len(last_dates)):
+            prev_date, curr_date = last_dates[i - 1], last_dates[i]
+            result, error = compare_two_snapshots_by_date(prev_date, curr_date, sheet_name)
+            if error:
+                st.warning(f"{prev_date} -> {curr_date}: {error}")
+                continue
 
-    col_a, col_b = st.columns([2, 1])
-    with col_a:
-        if status_counts["working"] + status_counts["failed"] > 0:
-            fig_status = go.Figure(data=[go.Pie(
-                labels=["Working", "Failed"],
-                values=[status_counts["working"], status_counts["failed"]],
-                hole=0.5,
-                marker_colors=["#10b981", "#ef4444"],
-                textinfo="label+percent+value",
-            )])
-            fig_status.update_layout(title="Current String Status", height=350)
-            st.plotly_chart(fig_status, use_container_width=True)
+            df_hist = result["df_history"]
+            inverter_col = result["inverter_col"]
+            pair_label = f"{prev_date} -> {curr_date}"
 
-    with col_b:
-        st.write("History last updated")
-        st.info(str(history.get("last_updated", "N/A")))
+            restored_total = int(df_hist["Failed_to_Working"].sum())
+            newly_failed_total = int(df_hist["Working_to_Failed"].sum())
+            current_failed_total = int(df_hist["Failed String Count_new"].sum())
 
+            comparison_rows.append({
+                "Comparison": pair_label,
+                "Restored Strings": restored_total,
+                "Newly Failed Strings": newly_failed_total,
+                "Failed as of To-Date": current_failed_total,
+            })
 
-def display_string_analysis(history, current_df):
-    st.subheader("🔌 String Analysis (Calendar Date Range)")
-
-    if not history.get("strings"):
-        st.info("No string history available.")
-        return
-
-    all_strings = [f"{inv}_{sid}" for inv, strings in history["strings"].items() for sid in strings.keys()]
-    if not all_strings:
-        st.info("No strings found in history.")
-        return
-
-    col1, col2 = st.columns(2)
-    with col1:
-        selected_strings = st.multiselect(
-            "Select Strings", all_strings,
-            default=all_strings[:5] if len(all_strings) > 5 else all_strings,
-            key="restore_select_strings",
-        )
-    with col2:
-        date_range = st.date_input(
-            "From Date -> To Date",
-            value=(datetime.now().date() - timedelta(days=7), datetime.now().date()),
-            max_value=datetime.now().date(),
-            key="restore_date_range_strings",
-        )
-
-    if not selected_strings:
-        st.warning("Please select at least one string.")
-        return
-
-    start_date, end_date = None, None
-    if isinstance(date_range, (list, tuple)) and len(date_range) == 2:
-        start_date, end_date = date_range
-
-    string_data = []
-    for string_key in selected_strings:
-        parts = string_key.split("_", 1)
-        if len(parts) == 2:
-            inverter_id, string_id = parts
-            for event in calculate_failure_to_restore_tat(history, inverter_id, string_id, start_date, end_date):
-                string_data.append({
-                    "Inverter": inverter_id, "String": string_id,
-                    "Failure Date": event["failure_date"], "Restore Date": event["restore_date"],
-                    "TAT (Working Hours)": event["tat_working_hours"],
-                    "TAT (Actual Hours)": event["tat_actual_hours"], "Status": event["status"],
+            restored_rows = df_hist[df_hist["Failed_to_Working"] > 0][
+                ["Plot", "Block", inverter_col, "Failed_to_Working", "Restored_Strings"]
+            ].copy()
+            if not restored_rows.empty:
+                restored_rows.insert(0, "Comparison", pair_label)
+                restored_rows = restored_rows.rename(columns={
+                    inverter_col: "Inverter", "Failed_to_Working": "Restored Count",
                 })
+                restored_detail_frames.append(restored_rows)
 
-    if not string_data:
-        st.info("No events found for the selected strings in the date range.")
-        return
-
-    df_strings = pd.DataFrame(string_data)
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Total Events", len(df_strings))
-    tat_values = df_strings[df_strings["TAT (Working Hours)"] != "Ongoing"]["TAT (Working Hours)"]
-    c2.metric("Avg TAT (Working Hours)", f"{pd.to_numeric(tat_values, errors='coerce').mean():.1f}h" if not tat_values.empty else "N/A")
-    c3.metric("Total Restorations", len(df_strings[df_strings["Status"] == "restored"]))
-    c4.metric("Ongoing Failures", len(df_strings[df_strings["Status"] == "ongoing_failure"]))
-
-    st.dataframe(df_strings, use_container_width=True)
-
-    df_tat = df_strings[df_strings["TAT (Working Hours)"] != "Ongoing"].copy()
-    if not df_tat.empty:
-        df_tat["TAT (Working Hours)"] = pd.to_numeric(df_tat["TAT (Working Hours)"], errors="coerce")
-        fig = px.bar(df_tat, x="String", y="TAT (Working Hours)", color="Inverter",
-                     title="TAT by String (Working Hours)", labels={"TAT (Working Hours)": "TAT (Hours)"})
-        fig.update_layout(height=400)
-        st.plotly_chart(fig, use_container_width=True)
-
-
-def display_tat_tracking(history, current_df):
-    st.subheader("⏱️ TAT Tracking")
-
-    if not history.get("strings"):
-        st.info("No TAT history available.")
-        return
-
-    rows = []
-    for inverter_id, strings in history["strings"].items():
-        for string_id in strings.keys():
-            for event in calculate_failure_to_restore_tat(history, inverter_id, string_id):
-                rows.append({
-                    "Inverter": inverter_id, "String": string_id,
-                    "Failure Date": event["failure_date"], "Restore Date": event["restore_date"],
-                    "TAT Working Hours": event["tat_working_hours"],
-                    "TAT Actual Hours": event["tat_actual_hours"], "Status": event["status"],
+            failed_rows = df_hist[df_hist["Working_to_Failed"] > 0][
+                ["Plot", "Block", inverter_col, "Working_to_Failed", "Newly_Failed_Strings"]
+            ].copy()
+            if not failed_rows.empty:
+                failed_rows.insert(0, "Comparison", pair_label)
+                failed_rows = failed_rows.rename(columns={
+                    inverter_col: "Inverter", "Working_to_Failed": "Newly Failed Count",
                 })
+                failed_detail_frames.append(failed_rows)
 
-    if not rows:
-        st.info("No TAT events found.")
+    if not comparison_rows:
+        st.info("No valid day-over-day comparisons could be computed.")
         return
 
-    df_tat = pd.DataFrame(rows)
-    st.dataframe(df_tat, use_container_width=True)
+    df_comparison = pd.DataFrame(comparison_rows)
 
-    restored = df_tat[df_tat["Status"] == "restored"].copy()
-    if not restored.empty:
-        restored["TAT Working Hours"] = pd.to_numeric(restored["TAT Working Hours"], errors="coerce")
-        fig = px.histogram(restored, x="TAT Working Hours", nbins=20, title="Distribution of TAT Working Hours")
-        fig.update_layout(height=400)
-        st.plotly_chart(fig, use_container_width=True)
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Total Restored (window)", int(df_comparison["Restored Strings"].sum()))
+    c2.metric("Total Newly Failed (window)", int(df_comparison["Newly Failed Strings"].sum()))
+    c3.metric("Failed as of Latest Date", int(df_comparison["Failed as of To-Date"].iloc[-1]))
+
+    st.dataframe(df_comparison, use_container_width=True)
+
+    fig_compare = go.Figure()
+    fig_compare.add_trace(go.Bar(x=df_comparison["Comparison"], y=df_comparison["Restored Strings"],
+                                  name="Restored", marker_color="#10b981"))
+    fig_compare.add_trace(go.Bar(x=df_comparison["Comparison"], y=df_comparison["Newly Failed Strings"],
+                                  name="Newly Failed", marker_color="#ef4444"))
+    fig_compare.add_trace(go.Scatter(x=df_comparison["Comparison"], y=df_comparison["Failed as of To-Date"],
+                                      name="Failed as of To-Date", mode="lines+markers",
+                                      line=dict(color="#fbbf24", width=3), yaxis="y"))
+    fig_compare.update_layout(
+        barmode="group", title="Restored vs Newly Failed Strings by Day-Pair",
+        height=420, plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    )
+    st.plotly_chart(fig_compare, use_container_width=True, key="summary_compare_chart")
+
+    # ---- Restored strings detail ----
+    st.markdown("---")
+    st.markdown("#### Restored Strings - Detail")
+    if restored_detail_frames:
+        df_restored = pd.concat(restored_detail_frames, ignore_index=True)
+        df_restored = df_restored.sort_values(["Comparison", "Restored Count"], ascending=[True, False])
+        page_restored = paginate_dataframe(df_restored, page_size=15, key_prefix="summary_restored")
+        st.dataframe(page_restored, use_container_width=True)
+        st.download_button(
+            "Download Restored Strings (CSV)", data=df_restored.to_csv(index=False),
+            file_name=f"restored_strings_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+            mime="text/csv", key="summary_restored_download",
+        )
+    else:
+        st.success("No strings restored in this window.")
+
+    st.markdown("#### Newly Failed Strings - Detail")
+    if failed_detail_frames:
+        df_failed = pd.concat(failed_detail_frames, ignore_index=True)
+        df_failed = df_failed.sort_values(["Comparison", "Newly Failed Count"], ascending=[True, False])
+        page_failed = paginate_dataframe(df_failed, page_size=15, key_prefix="summary_failed")
+        st.dataframe(page_failed, use_container_width=True)
+        st.download_button(
+            "Download Newly Failed Strings (CSV)", data=df_failed.to_csv(index=False),
+            file_name=f"newly_failed_strings_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+            mime="text/csv", key="summary_failed_download",
+        )
+    else:
+        st.success("No new failures in this window.")
 
 
-def display_working_hours_analysis(history, current_df):
-    st.subheader("⏰ Working Hours")
+def display_working_hours_analysis():
+    """Reference info: configured working-hours window + available snapshot dates."""
+    st.subheader("Working Hours")
     st.write(f"Configured working hours: {WORKING_HOURS_START}:00 to {WORKING_HOURS_END}:00")
     st.write(f"Working hours counted per full day: {WORKING_HOURS_PER_DAY} hours")
+    st.caption("This window is what Restoration/Failure-hour figures elsewhere in this app are based on.")
 
-    available_dates = storage.get_available_snapshot_dates()
+    available_dates = get_available_snapshot_dates()
     if available_dates:
-        st.dataframe(pd.DataFrame({"Snapshot Date": available_dates}), use_container_width=True)
+        st.markdown(f"**{len(available_dates)}** snapshot date(s) available, from **{available_dates[0]}** to **{available_dates[-1]}**.")
+        page_dates = paginate_dataframe(
+            pd.DataFrame({"Snapshot Date": sorted(available_dates, reverse=True)}),
+            page_size=20, key_prefix="working_hours_dates",
+        )
+        st.dataframe(page_dates, use_container_width=True)
     else:
         st.info("No saved snapshot dates available.")
 
 
 def display_calendar_comparison(sheet_name="Sheet1"):
-    """Calendar-wise (From Date -> To Date) comparison, replacing the old
-    'pick exactly 3 dates' workflow."""
-    st.subheader("📅 Calendar-wise Comparison (From Date -> To Date)")
+    """From-date -> To-date comparison with restored/failed breakdown, top
+    movers, an availability trend, and a paginated detail table."""
+    st.subheader("Calendar-wise Comparison (From Date -> To Date)")
 
-    available_dates = storage.get_available_snapshot_dates()
+    available_dates = get_available_snapshot_dates()
     if len(available_dates) < 2:
         st.info("At least 2 saved snapshot dates are required for comparison.")
         return
@@ -631,92 +988,106 @@ def display_calendar_comparison(sheet_name="Sheet1"):
         st.error("From Date must be on or before To Date.")
         return
 
-    from_str, to_str = str(from_date), str(to_date)
-    dates_in_range = [d for d in available_dates if from_str <= d <= to_str]
+    with st.spinner("Loading comparison data..."):
+        result, error = compare_two_snapshots_by_date(str(from_date), str(to_date), sheet_name)
 
-    if len(dates_in_range) < 2:
-        st.warning("Need at least 2 saved snapshots within the selected date range.")
-        return
-
-    baseline_date, latest_date = dates_in_range[0], dates_in_range[-1]
-    st.caption(
-        f"Comparing baseline **{baseline_date}** against latest **{latest_date}** "
-        f"({len(dates_in_range)} snapshots found in range)."
-    )
-
-    result, error = compare_two_snapshots_by_date(baseline_date, latest_date, sheet_name)
     if error:
         st.error(error)
-    else:
-        df_history = result["df_history"]
-        baseline_current = result["baseline_avg_working_current"]
+        return
 
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Baseline Date", baseline_date)
-        c2.metric("Latest Date", latest_date)
-        c3.metric("Baseline Avg Working Current", f"{baseline_current:.2f} A")
+    df_history = result["df_history"]
+    inverter_col = result["inverter_col"]
+    baseline_current = result["baseline_avg_working_current"]
 
-        st.dataframe(
-            df_history.sort_values(by="Current_Failure_Hours", ascending=False),
-            use_container_width=True,
-        )
-        st.caption("Time-based metrics assume one interval equals working hours from 6 AM to 6 PM.")
+    restored_total = int(df_history["Failed_to_Working"].sum())
+    newly_failed_total = int(df_history["Working_to_Failed"].sum())
+    failed_from = int(df_history["Failed String Count_old"].sum())
+    failed_to = int(df_history["Failed String Count_new"].sum())
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("From -> To", f"{from_date} -> {to_date}")
+    c2.metric("Restored Strings", restored_total)
+    c3.metric("Newly Failed Strings", newly_failed_total)
+    c4.metric("Failed: From-Date", failed_from)
+    c5.metric("Failed: To-Date", failed_to, delta=int(failed_to - failed_from), delta_color="inverse")
+
+    st.caption(f"Baseline average working current: {baseline_current:.2f} A · Time-based metrics assume {WORKING_HOURS_START}:00-{WORKING_HOURS_END}:00 working hours per day.")
 
     st.markdown("---")
-    st.markdown("#### 📈 Trend Across the Selected Range")
+    st.markdown("#### Top Movers (Change in Lost Current)")
+    movers = df_history[["Plot", "Block", inverter_col, "Change_Lost_Current",
+                          "Failed_to_Working", "Working_to_Failed"]].copy()
+    movers = movers.rename(columns={inverter_col: "Inverter"})
 
-    df_trend = build_range_trend_data(from_date, to_date, sheet_name)
+    top_improved = movers.sort_values("Change_Lost_Current").head(10)
+    top_degraded = movers.sort_values("Change_Lost_Current", ascending=False).head(10)
+
+    mv_col1, mv_col2 = st.columns(2)
+    with mv_col1:
+        fig_improved = px.bar(
+            top_improved.sort_values("Change_Lost_Current"), x="Change_Lost_Current", y="Inverter",
+            orientation="h", title="Top 10 Most Improved (Lost Current Reduced)",
+            color_discrete_sequence=["#10b981"],
+        )
+        fig_improved.update_layout(height=380, plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)")
+        st.plotly_chart(fig_improved, use_container_width=True, key="cal_top_improved")
+    with mv_col2:
+        fig_degraded = px.bar(
+            top_degraded.sort_values("Change_Lost_Current"), x="Change_Lost_Current", y="Inverter",
+            orientation="h", title="Top 10 Most Degraded (Lost Current Increased)",
+            color_discrete_sequence=["#ef4444"],
+        )
+        fig_degraded.update_layout(height=380, plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)")
+        st.plotly_chart(fig_degraded, use_container_width=True, key="cal_top_degraded")
+
+    st.markdown("---")
+    st.markdown("#### Full Comparison Detail")
+    display_history = df_history.rename(columns={inverter_col: "Inverter"}).sort_values(
+        by="Current_Failure_Hours", ascending=False
+    )
+    page_history = paginate_dataframe(display_history, page_size=25, key_prefix="calendar_compare")
+    st.dataframe(page_history, use_container_width=True)
+    st.download_button(
+        "Download Full Comparison (CSV)", data=display_history.to_csv(index=False),
+        file_name=f"calendar_compare_{from_date}_{to_date}.csv",
+        mime="text/csv", key="calendar_compare_download",
+    )
+
+    st.markdown("---")
+    st.markdown("#### Trend Across the Selected Range")
+
+    with st.spinner("Loading trend data..."):
+        df_trend = build_range_trend_data(from_date, to_date, sheet_name)
+
     if df_trend.empty:
-        st.info("No trend data available for this range (check that sheet name matches saved snapshots).")
+        st.info("No trend data available for this range.")
         return
 
     fig_avail = px.line(
         df_trend, x="Date", y="Availability (%)", color="Plot", line_group="Block",
         markers=True, title="Availability Trend by Plot / Block",
     )
-    fig_avail.update_layout(height=450)
-    st.plotly_chart(fig_avail, use_container_width=True)
+    fig_avail.update_layout(height=450, plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)")
+    st.plotly_chart(fig_avail, use_container_width=True, key="cal_trend_avail")
 
     fig_wf = px.bar(
         df_trend, x="Date", y=["Working", "Failed"], facet_col="Plot",
         barmode="stack", title="Working vs Failed Strings Over Time (by Plot)",
         color_discrete_sequence=["#10b981", "#ef4444"],
     )
-    fig_wf.update_layout(height=450)
-    st.plotly_chart(fig_wf, use_container_width=True)
+    fig_wf.update_layout(height=450, plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)")
+    st.plotly_chart(fig_wf, use_container_width=True, key="cal_trend_stacked")
 
 
 # ==========================================
 # MAIN ENTRY
 # ==========================================
-# def display_tat_dashboard(processed_dataframes=None, current_df=None, sheet_name="Sheet1",
-#                            user_role="viewer", username="unknown", upload_handler=None):
-#     st.title("🔄 Restore & TAT Analysis")
-#     st.caption("Day-wise SCADA snapshots (uploaded from the sidebar) power history, TAT, and calendar comparisons.")
-import streamlit as st
-
 def display_tat_dashboard(processed_dataframes=None, current_df=None, sheet_name="Sheet1",
                            user_role="viewer", username="unknown", upload_handler=None):
-    st.markdown("""
-    <style>
-    .blink-msg {
-        font-size: 18px;
-        font-weight: 700;
-        color: #d62828;
-        animation: blink 1s linear infinite;
-        text-align: center;
-        padding: 10px 0;
-    }
-    @keyframes blink {
-        0%, 100% { opacity: 1; }
-        50% { opacity: 0; }
-    }
-    </style>
-    <div class="blink-msg">⚠️ We are under maintenance. Stay tuned....</div>
-    """, unsafe_allow_html=True)
+    """Main entry point for the Restore & TAT dashboard."""
+    st.title("Restore & TAT Analysis")
+    st.caption("Day-wise SCADA snapshots power the summary, history matrix, and calendar comparison below.")
 
-    st.title("🔄 Restore & TAT Analysis")
-    st.caption("Day-wise SCADA snapshots (uploaded from the sidebar) power history, TAT, and calendar comparisons.")
     init_history()
     history = load_string_history()
 
@@ -726,30 +1097,26 @@ def display_tat_dashboard(processed_dataframes=None, current_df=None, sheet_name
         history = load_string_history()
 
     tabs = st.tabs([
-        "📤 Upload Registry",
-        "📊 Summary Dashboard",
-        "🔌 String Analysis",
-        "⏱️ TAT Tracking",
-        "⏰ Working Hours",
-        "📅 Calendar Compare",
+        "Upload Registry",
+        "Summary Dashboard",
+        "String History Matrix",
+        "Working Hours",
+        "Calendar Compare",
     ])
 
     with tabs[0]:
         display_upload_registry(user_role, upload_handler=upload_handler)
 
     with tabs[1]:
-        display_summary_dashboard(history, current_df)
+        display_summary_dashboard(sheet_name)
 
     with tabs[2]:
-        display_string_analysis(history, current_df)
+        display_string_history_matrix(history, current_df)
 
     with tabs[3]:
-        display_tat_tracking(history, current_df)
+        display_working_hours_analysis()
 
     with tabs[4]:
-        display_working_hours_analysis(history, current_df)
-
-    with tabs[5]:
         display_calendar_comparison(sheet_name)
 
 
