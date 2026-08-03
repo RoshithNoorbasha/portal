@@ -10,15 +10,23 @@ Sections:
   2. User management incl. roles   (data/users.json)
   3. Hash-chained audit log        (data/audit_log.json)
   4. Super-admin user-data backup / restore (data/backups)
+  5. Login session tokens          (data/sessions.json)
 
 Having ONE registry file for uploads means:
   - app.py always knows what the "current" (latest) file is.
   - restore.py can compare any two calendar dates without re-uploading,
     because every upload's processed sheets are already saved as CSV.
+
+STORAGE NOTE: the original uploaded .xlsx is used only in-memory (to hash
+it for de-dup and to parse it into per-sheet CSVs). It is never written to
+disk. Only the processed CSVs are persisted, since that is all the app
+actually needs to render dashboards/history - keeping the original around
+too would roughly double storage for no benefit.
 """
 
 import hashlib
 import json
+import secrets
 import time
 from datetime import datetime
 from functools import lru_cache
@@ -41,6 +49,9 @@ AUDIT_FILE = DATA_DIR / "audit_log.json"
 
 BACKUP_DIR = DATA_DIR / "backups"
 BACKUP_DIR.mkdir(exist_ok=True)
+
+SESSIONS_FILE = DATA_DIR / "sessions.json"
+SESSION_TTL_SECONDS = 24 * 60 * 60  # a login stays valid for 1 day, even across page refreshes
 
 # ==========================================
 # UPLOAD LOCK - Prevent concurrent uploads
@@ -143,8 +154,13 @@ def _save_registry(data):
 def save_preprocessed_upload(file_bytes, original_filename, processed_dataframes,
                               snapshot_date, uploaded_by):
     """
-    Persist a newly uploaded + processed SCADA workbook.
-    Ensures only ONE file is stored per snapshot_date.
+    Persist a newly processed SCADA workbook.
+    Ensures only ONE snapshot is stored per snapshot_date.
+
+    STORAGE OPTIMIZATION: only the processed per-sheet CSVs are written to
+    disk. `file_bytes` is used in-memory to compute a de-dup hash, but the
+    raw workbook itself is never saved - the processed CSVs are all the
+    app needs to render dashboards, history, and TAT comparisons.
     """
     # Acquire lock to prevent concurrent uploads
     if not _acquire_upload_lock():
@@ -190,12 +206,8 @@ def save_preprocessed_upload(file_bytes, original_filename, processed_dataframes
         upload_path = PREPROCESS_DIR / upload_id
         upload_path.mkdir(parents=True, exist_ok=True)
 
-        # Save original file
-        ext = Path(original_filename).suffix or ".xlsx"
-        with open(upload_path / f"original{ext}", "wb") as f:
-            f.write(file_bytes)
-
-        # Save processed sheets
+        # NOTE: the original workbook is intentionally NOT written to disk -
+        # only the processed per-sheet CSVs are persisted (storage optimization).
         saved_sheets = []
         for sheet_name, df in processed_dataframes.items():
             if df is not None and not df.empty:
@@ -207,7 +219,6 @@ def save_preprocessed_upload(file_bytes, original_filename, processed_dataframes
         entry = {
             "upload_id": upload_id,
             "original_filename": original_filename,
-            "original_ext": ext,
             "upload_timestamp": timestamp.strftime("%Y-%m-%d %H:%M:%S"),
             "snapshot_date": snapshot_date_str,
             "file_hash": file_hash,
@@ -238,8 +249,16 @@ def get_all_uploads():
 
 
 def get_latest_upload():
+    """
+    The "current" upload is defined by the most recent snapshot_date, NOT
+    the most recent upload_timestamp. Otherwise a backfilled upload for an
+    older date (uploaded after a more recent one) would wrongly become
+    "current" just because it was saved last.
+    """
     uploads = get_all_uploads()
-    return uploads[-1] if uploads else None
+    if not uploads:
+        return None
+    return max(uploads, key=lambda u: (u.get("snapshot_date", ""), u.get("upload_timestamp", "")))
 
 
 def get_upload_by_id(upload_id):
@@ -255,26 +274,6 @@ def get_upload_for_date(snapshot_date):
     if not matches:
         return None
     return sorted(matches, key=lambda x: x["upload_timestamp"])[-1]
-
-
-@lru_cache(maxsize=32)
-def _read_bytes_cached(path_str, mtime):
-    with open(path_str, "rb") as f:
-        return f.read()
-
-
-def load_original_bytes(upload_id):
-    """Uploads are immutable once written, so once a given (path, mtime)
-    pair has been read from disk it's safe to keep serving it from memory
-    - this avoids re-reading the (often large) raw excel bytes from disk
-    on every Streamlit rerun."""
-    entry = get_upload_by_id(upload_id)
-    if not entry:
-        return None
-    path = PREPROCESS_DIR / upload_id / f"original{entry.get('original_ext', '.xlsx')}"
-    if path.exists():
-        return _read_bytes_cached(str(path), path.stat().st_mtime)
-    return None
 
 
 @lru_cache(maxsize=256)
@@ -299,8 +298,9 @@ def get_processed_dataframes_for_date(snapshot_date):
     """
     Load every already-preprocessed sheet that was saved for a given calendar
     date, straight from the CSV cache (no re-parsing of the original workbook
-    needed). Powers the header "calendar" selector on the main dashboard so
-    users can jump between previously uploaded snapshots.
+    needed - the original isn't stored at all). Powers the header "calendar"
+    selector on the main dashboard so users can jump between previously
+    uploaded snapshots.
     Returns (dict[sheet_name -> DataFrame] or None, registry entry or None).
     """
     entry = get_upload_for_date(snapshot_date)
@@ -316,19 +316,18 @@ def get_processed_dataframes_for_date(snapshot_date):
 
 def verify_upload_integrity(upload_id):
     """
-    Confirm that a registry entry's underlying files actually exist on disk
-    (original workbook + every saved sheet CSV). Redeploys/volume resets can
-    leave a "ghost" registry entry with no backing files, which otherwise
-    fails silently deep inside pandas. Returns (is_ok: bool, message: str).
+    Confirm that a registry entry's underlying sheet CSVs actually exist on
+    disk. Redeploys/volume resets can leave a "ghost" registry entry with no
+    backing files, which otherwise fails silently deep inside pandas.
+    Returns (is_ok: bool, message: str).
     """
     entry = get_upload_by_id(upload_id)
     if not entry:
         return False, "Not found in registry"
 
     upload_path = PREPROCESS_DIR / upload_id
-    original_path = upload_path / f"original{entry.get('original_ext', '.xlsx')}"
-    if not original_path.exists():
-        return False, "Original workbook missing on disk"
+    if not upload_path.exists():
+        return False, "Upload folder missing on disk"
 
     missing_sheets = []
     for sheet_name in entry.get("saved_sheets", []):
@@ -751,3 +750,77 @@ def get_audit_log_for(username, role):
     if role == "engineer":
         return [e for e in entries if e.get("username") == username]
     return []
+
+
+def clear_audit_log():
+    """
+    Super-admin-only: wipe the ENTIRE audit log.
+
+    Individual entries can't be deleted one at a time because the log is
+    hash-chained for tamper-evidence - each entry's hash depends on the
+    previous entry's hash, so silently removing one entry from the middle
+    would either break the chain (making verify_audit_chain() falsely
+    report tampering) or require silently re-chaining the remaining
+    entries (which defeats the point of a tamper-evident log). A full
+    clear is the only operation that preserves that guarantee.
+    """
+    _save_audit({"entries": []})
+    return True, "Audit log cleared."
+
+
+# ==========================================
+# 5. LOGIN SESSION TOKENS
+# ==========================================
+# Streamlit's st.session_state does not survive a browser refresh (a
+# refresh opens a brand-new session). To keep a user logged in for the
+# rest of the day even after a refresh, we hand out an opaque token that
+# app.py stores in the URL's query params and looks up here on load.
+def _load_sessions():
+    data = _read_json(SESSIONS_FILE, {})
+    return data if isinstance(data, dict) else {}
+
+
+def _save_sessions(sessions):
+    _write_json(SESSIONS_FILE, sessions)
+    _invalidate_cache()
+
+
+def _purge_expired_sessions(sessions):
+    now = time.time()
+    return {tok: s for tok, s in sessions.items() if s.get("expires_at", 0) > now}
+
+
+def create_session(username):
+    """Create a new login session token, valid for SESSION_TTL_SECONDS (1 day)."""
+    sessions = _purge_expired_sessions(_load_sessions())
+    token = secrets.token_urlsafe(32)
+    sessions[token] = {
+        "username": username,
+        "created_at": time.time(),
+        "expires_at": time.time() + SESSION_TTL_SECONDS,
+    }
+    _save_sessions(sessions)
+    return token
+
+
+def get_session_user(token):
+    """Return the username for a still-valid session token, or None."""
+    if not token:
+        return None
+    sessions = _load_sessions()
+    entry = sessions.get(token)
+    if not entry:
+        return None
+    if entry.get("expires_at", 0) < time.time():
+        return None
+    return entry.get("username")
+
+
+def delete_session(token):
+    """Invalidate a session token (used on logout)."""
+    if not token:
+        return
+    sessions = _load_sessions()
+    if token in sessions:
+        del sessions[token]
+        _save_sessions(sessions)

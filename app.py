@@ -2,7 +2,6 @@
 import io
 import re
 import json
-import hashlib
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
@@ -10,8 +9,10 @@ import streamlit as st
 from datetime import datetime
 from pathlib import Path
 import restore  # Restore & TAT module
-import storage1  # Shared backend storage (uploads, users, audit log)
+import storage1  # Shared backend storage (uploads, users, audit log, sessions)
 from functools import lru_cache
+from openpyxl.styles import PatternFill, Font, Alignment
+from openpyxl.utils import get_column_letter
 
 # ==========================================
 # 1. PAGE CONFIGURATION & STYLING
@@ -23,8 +24,9 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Font Awesome CDN
+# Font Awesome CDN + mobile-friendly viewport
 st.markdown("""
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
 <style>
     .main .block-container { padding-top: 1.2rem; padding-bottom: 2rem; }
@@ -138,6 +140,28 @@ st.markdown("""
         border-radius: 16px;
         padding: 16px 18px 6px 18px;
     }
+
+    /* ---------- Login page ---------- */
+    .login-title { text-align: center; margin-bottom: 0.2rem; }
+    .login-subtitle { text-align: center; color: #94a3b8; margin-bottom: 1.25rem; }
+    .login-card {
+        max-width: 400px; margin: 0.5rem auto 0 auto;
+        background: rgba(15, 23, 42, 0.65);
+        border: 1px solid rgba(148, 163, 184, 0.18);
+        border-radius: 18px;
+        padding: 28px 26px 20px 26px;
+        box-shadow: 0 20px 45px rgba(2, 6, 23, 0.35);
+    }
+
+    /* ---------- Mobile tweaks ---------- */
+    @media (max-width: 640px) {
+        .main .block-container { padding: 0.9rem 0.6rem !important; }
+        .login-card { padding: 20px 16px 14px 16px; border-radius: 14px; margin-top: 0.25rem; }
+        /* 16px stops iOS Safari from auto-zooming into text inputs */
+        div[data-testid="stTextInput"] input { font-size: 16px !important; }
+        .app-header { flex-direction: column; align-items: flex-start; padding: 16px 18px; }
+        div[data-testid="stMetricValue"] { font-size: 1.35rem; }
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -175,6 +199,8 @@ ROLE_BADGES = {
     "engineer": "🔧 Engineer",
 }
 
+SESSION_QUERY_PARAM = "session"
+
 # ==========================================
 # 3. USER / SESSION HELPERS (delegates to storage.py)
 # ==========================================
@@ -200,6 +226,50 @@ def is_engineer():
 def is_super_admin():
     user = get_current_user()
     return bool(user) and storage1.is_super_admin(user.get("username"))
+
+def _login_user(username, user_data, persist=True):
+    """Populate session_state for a logged-in user and, by default, hand out
+    a session token stored in the URL so the login survives a page refresh
+    for the rest of the day (see storage1.SESSION_TTL_SECONDS)."""
+    st.session_state.user = {
+        "username": username,
+        "role": user_data["role"],
+        "full_name": user_data.get("full_name", username),
+        "assigned_plots": user_data.get("assigned_plots", []),
+    }
+    st.session_state.authenticated = True
+    if persist:
+        token = storage1.create_session(username)
+        st.query_params[SESSION_QUERY_PARAM] = token
+
+def _logout_user():
+    token = st.query_params.get(SESSION_QUERY_PARAM)
+    if token:
+        storage1.delete_session(token)
+    try:
+        del st.query_params[SESSION_QUERY_PARAM]
+    except KeyError:
+        pass
+    st.session_state.authenticated = False
+    st.session_state.user = None
+
+def _try_restore_session():
+    """On a fresh browser session (e.g. after a page refresh), check the URL
+    for a still-valid session token and silently re-authenticate the user
+    instead of forcing them back to the login form."""
+    if st.session_state.get("authenticated"):
+        return
+    token = st.query_params.get(SESSION_QUERY_PARAM)
+    if not token:
+        return
+    username = storage1.get_session_user(token)
+    if not username:
+        return
+    users = storage1.load_users()
+    user_data = users.get(username)
+    if not user_data:
+        return
+    _login_user(username, user_data, persist=False)  # token already exists, don't mint a new one
 
 # ==========================================
 # 4. OPTIMIZED HELPERS WITH CACHING
@@ -358,12 +428,124 @@ def get_column_header_color(value):
     else:
         return "#ef4444"
 
+
+# ==========================================
+# 4b. COLORED EXCEL EXPORT HELPERS
+#
+# Every on-screen table in this app is color-coded (availability, health
+# status, failed-string counts, PV current health, negative-value flags).
+# CSV has no concept of cell color, so "export with the same UI colors"
+# means Excel (.xlsx) with openpyxl cell fills applied - these helpers
+# mirror the exact color logic used by the on-screen pandas Styler
+# functions (color_availability, color_health_status, color_failed_strings,
+# get_string_health_color) so a downloaded file looks like the screen.
+# ==========================================
+def _availability_hex(value):
+    """Hex fill for an 'Availability (%)' cell - mirrors color_availability()."""
+    if not isinstance(value, (int, float)) or pd.isna(value):
+        return None
+    if value >= 90: return "#10b981"
+    elif value >= 70: return "#34d399"
+    elif value >= 50: return "#fbbf24"
+    elif value >= 30: return "#f59e0b"
+    else: return "#ef4444"
+
+def _health_status_hex(value):
+    """Hex fill for a 'Health Status' cell - mirrors color_health_status()."""
+    return {
+        "Excellent": "#10b981", "Good": "#34d399",
+        "Fair": "#fbbf24", "Poor": "#ef4444",
+    }.get(str(value))
+
+def _failed_count_hex(value):
+    """Hex fill for a failed-string-count cell - mirrors color_failed_strings()."""
+    if not isinstance(value, (int, float)) or pd.isna(value):
+        return None
+    if value == 0: return "#10b981"
+    elif value <= 2: return "#fbbf24"
+    elif value <= 5: return "#f59e0b"
+    else: return "#ef4444"
+
+def _pv_current_hex(value):
+    """Hex fill for a PV-I current cell - mirrors get_string_health_color()."""
+    if not isinstance(value, (int, float)) or pd.isna(value):
+        return None
+    return get_string_health_color(value)
+
+def _negative_flag_hex(value):
+    """Always-red fill used for the Negative PV Details report."""
+    return "#7f1d1d"
+
+# Dark text reads better than white on the lighter yellow/amber fills.
+_DARK_TEXT_COLORS = {"#fbbf24"}
+
+def _hex_to_argb(hex_color):
+    h = hex_color.lstrip("#")
+    return f"FF{h.upper()}"
+
+def build_colored_excel(dataframes_dict, color_rules_by_sheet=None):
+    """
+    Write one or more DataFrames to a single .xlsx, applying the given
+    per-column color rules as real Excel cell fills so the download looks
+    like the color-coded tables on screen.
+
+    dataframes_dict: {sheet_name: DataFrame}
+    color_rules_by_sheet: {sheet_name: {column_name: value -> hex_color_or_None}}
+    """
+    color_rules_by_sheet = color_rules_by_sheet or {}
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        for sheet_name, df in dataframes_dict.items():
+            safe_name = str(sheet_name)[:31]
+            df.to_excel(writer, sheet_name=safe_name, index=False)
+            ws = writer.sheets[safe_name]
+
+            # Header styling
+            for cell in ws[1]:
+                cell.font = Font(bold=True, color="FFFFFFFF")
+                cell.fill = PatternFill(start_color="FF1E293B", end_color="FF1E293B", fill_type="solid")
+                cell.alignment = Alignment(horizontal="center", vertical="center")
+            ws.freeze_panes = "A2"
+
+            color_rules = color_rules_by_sheet.get(sheet_name, {})
+            header_to_col = {cell.value: idx for idx, cell in enumerate(ws[1], start=1)}
+
+            for col_name, color_func in color_rules.items():
+                col_idx = header_to_col.get(col_name)
+                if not col_idx:
+                    continue
+                col_letter = get_column_letter(col_idx)
+                for row in range(2, ws.max_row + 1):
+                    cell = ws[f"{col_letter}{row}"]
+                    color = color_func(cell.value)
+                    if color:
+                        argb = _hex_to_argb(color)
+                        cell.fill = PatternFill(start_color=argb, end_color=argb, fill_type="solid")
+                        cell.font = Font(
+                            bold=True,
+                            color="FF000000" if color.lower() in _DARK_TEXT_COLORS else "FFFFFFFF",
+                        )
+
+            # Reasonable auto-width so colored cells aren't squeezed
+            for idx, column_cells in enumerate(ws.columns, start=1):
+                longest = max((len(str(c.value)) if c.value is not None else 0) for c in column_cells)
+                ws.column_dimensions[get_column_letter(idx)].width = min(max(longest + 2, 10), 42)
+
+    buffer.seek(0)
+    return buffer.getvalue()
+
+def build_pv_current_color_rules(pv_current_cols):
+    """One {column_name: _pv_current_hex} entry per PV-I column present."""
+    return {col: _pv_current_hex for col in pv_current_cols}
+
 # ==========================================
 # 5. OPTIMIZED PARSER WITH CACHING
 # ==========================================
 @st.cache_data(show_spinner=False, ttl=3600)
 def process_scada_excel_bytes(file_bytes, filename_hash=None):
-    """Process SCADA file with caching based on file content"""
+    """Process SCADA file with caching based on file content. This is the
+    ONLY place the raw workbook bytes are read - the bytes themselves are
+    never written to disk (see storage1.save_preprocessed_upload)."""
     file_stream = io.BytesIO(file_bytes)
     excel_file = pd.ExcelFile(file_stream, engine="openpyxl")
     processed_dfs = {}
@@ -415,7 +597,9 @@ def process_scada_excel_bytes(file_bytes, filename_hash=None):
 
 
 def process_scada_excel_with_status(file_bytes, filename_hash=None, source_label="SCADA workbook"):
-    """Run the cached parser behind a polished, step-by-step Streamlit status card."""
+    """Run the cached parser behind a polished, step-by-step Streamlit status card.
+    Used at UPLOAD time only - browsing an already-processed snapshot date
+    never touches the raw workbook (there isn't one stored on disk)."""
     steps = [
         ("📖", "Reading workbook", "Opening the file and detecting sheet structure..."),
         ("🧭", "Mapping identifiers", "Extracting Plot / Block / SACU from inverter IDs..."),
@@ -485,17 +669,6 @@ def assign_manual_headers(df, manual_headers):
     else:
         df.columns = manual_headers[:len(df.columns)]
     return df
-
-MANUAL_SCADA_COLUMNS = [
-    "String Inverter", "MBUS", "Grid", "E-Daily(KWH)", "Active Power", "Reactive Power",
-    "PV1", "PV2", "PV3", "PV4", "PV5", "PV6", "PV7", "PV8", "PV9", "PV10",
-    "PV11", "PV12", "PV13", "PV14", "PV15", "PV16", "PV17", "PV18", "PV19", "PV20",
-    "PV21", "PV22", "PV23", "PV24", "PV25", "PV26", "PV27", "PV28",
-    "PV-I1", "PV-I2", "PV-I3", "PV-I4", "PV-I5", "PV-I6", "PV-I7", "PV-I8", "PV-I9", "PV-I10",
-    "PV-I11", "PV-I12", "PV-I13", "PV-I14", "PV-I15", "PV-I16", "PV-I17", "PV-I18", "PV-I19", "PV-I20",
-    "PV-I21", "PV-I22", "PV-I23", "PV-I24", "PV-I25", "PV-I26", "PV-I27", "PV-I28",
-    "VAB", "VBC", "VCA", "IA", "IB", "IC"
-]
 
 ROLE_BADGES = {
     "admin": '<i class="fas fa-crown"></i> Admin',
@@ -588,14 +761,32 @@ def display_negative_pv_values(df_result, sheet_name="Sheet1"):
         subset=["PV Value"],
     )
     st.dataframe(styled_negative, use_container_width=True, height=340)
-    st.download_button(
-        label="Download Negative PV Details (CSV)",
-        data=df_negative_pv.to_csv(index=False),
-        file_name=f"negative_pv_values_{sheet_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-        mime="text/csv",
-        use_container_width=True,
-        key=f"negative_pv_download_{sheet_name}",
-    )
+
+    dl_col1, dl_col2 = st.columns(2)
+    with dl_col1:
+        st.download_button(
+            label="Download (CSV)",
+            data=df_negative_pv.to_csv(index=False),
+            file_name=f"negative_pv_values_{sheet_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+            mime="text/csv",
+            use_container_width=True,
+            key=f"negative_pv_download_{sheet_name}",
+            on_click=_log_download, args=(f"negative_pv_csv:{sheet_name}",),
+        )
+    with dl_col2:
+        colored_bytes = build_colored_excel(
+            {"Negative PV": df_negative_pv},
+            {"Negative PV": {"PV Value": _negative_flag_hex}},
+        )
+        st.download_button(
+            label="Download (Colored Excel)",
+            data=colored_bytes,
+            file_name=f"negative_pv_values_{sheet_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+            key=f"negative_pv_download_colored_{sheet_name}",
+            on_click=_log_download, args=(f"negative_pv_colored_excel:{sheet_name}",),
+        )
 
 # ==========================================
 # 6. UI - USER MANAGEMENT
@@ -742,6 +933,7 @@ def render_super_admin_panel(current_user, role):
       - export/download a fresh login-data backup
       - restore missing users from an uploaded backup
       - browse, download, and delete server-side saved backup snapshots
+      - clear the audit log
       - danger zone: reset ALL application data except user accounts
     """
     with st.sidebar.expander("🛡️ Super Admin Panel", expanded=False):
@@ -822,6 +1014,35 @@ def render_super_admin_panel(current_user, role):
                     if st.button("Cancel", key="confirm_delete_all_backups_no", use_container_width=True):
                         del st.session_state.confirm_delete_all_backups
                         st.rerun()
+
+        st.markdown("---")
+        st.markdown("**🧾 Audit Log**")
+        st.caption(
+            "Entries are hash-chained for tamper evidence, so individual entries can't be deleted one at a time - "
+            "only a full clear is offered, to keep the chain meaningful."
+        )
+        if st.button("🗑️ Clear Entire Audit Log", key="clear_audit_log_btn", use_container_width=True):
+            st.session_state.confirm_clear_audit_log = True
+            st.rerun()
+
+        if st.session_state.get("confirm_clear_audit_log"):
+            st.warning("This will permanently delete every audit log entry. This cannot be undone.")
+            ac1, ac2 = st.columns(2)
+            with ac1:
+                if st.button("Yes, clear log", key="confirm_clear_audit_log_yes", use_container_width=True):
+                    ok, msg = storage1.clear_audit_log()
+                    # Log the clear action itself so there's at least a record that it happened.
+                    storage1.log_audit_event(current_user["username"], role, "audit_log_cleared", {})
+                    if ok:
+                        st.success(msg)
+                    else:
+                        st.error(msg)
+                    del st.session_state.confirm_clear_audit_log
+                    st.rerun()
+            with ac2:
+                if st.button("Cancel", key="confirm_clear_audit_log_no", use_container_width=True):
+                    del st.session_state.confirm_clear_audit_log
+                    st.rerun()
 
         st.markdown("---")
         st.markdown(
@@ -1702,14 +1923,38 @@ def create_pv_string_tab(df):
                 st.dataframe(failed_detail_display, use_container_width=True, height=400)
 
             csv_failed = failed_detail_display.to_csv(index=False)
-            st.download_button(
-                label="Download Failed Inverters (CSV)",
-                data=csv_failed,
-                file_name=f"failed_inverters_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                mime="text/csv",
-                key="download_failed_inverters_csv",
-                on_click=_log_download, args=("failed_inverters_csv",),
-            )
+            fdl_col1, fdl_col2 = st.columns(2)
+            with fdl_col1:
+                st.download_button(
+                    label="Download (CSV)",
+                    data=csv_failed,
+                    file_name=f"failed_inverters_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                    key="download_failed_inverters_csv",
+                    on_click=_log_download, args=("failed_inverters_csv",),
+                )
+            with fdl_col2:
+                failed_color_rules = build_pv_current_color_rules(
+                    [c for c in pv_current_cols if c in failed_detail_display.columns]
+                )
+                if "Availability (%)" in failed_detail_display.columns:
+                    failed_color_rules["Availability (%)"] = _availability_hex
+                if "Failed" in failed_detail_display.columns:
+                    failed_color_rules["Failed"] = _failed_count_hex
+                failed_colored_bytes = build_colored_excel(
+                    {"Failed Inverters": failed_detail_display},
+                    {"Failed Inverters": failed_color_rules},
+                )
+                st.download_button(
+                    label="Download (Colored Excel)",
+                    data=failed_colored_bytes,
+                    file_name=f"failed_inverters_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                    key="download_failed_inverters_colored_excel",
+                    on_click=_log_download, args=("failed_inverters_colored_excel",),
+                )
 
 def get_styled_summary(summary_df):
     """Apply styling to summary dataframe without caching"""
@@ -1731,7 +1976,12 @@ def calculate_plot_summary_cached(df, inverter_col):
         return pd.DataFrame()
 
     plot_summary = df.groupby("Plot", as_index=False).agg(
-        Total_Inverters=(inverter_col if inverter_col else df.columns[0], "nunique"),
+        # "count" (non-null row count) rather than "nunique" - each row is
+        # already one inverter (that's the sheet's contract), so this
+        # matches the row count shown in the Data Table tab. nunique()
+        # would silently collapse any duplicate or blank Inverter ID
+        # values and undercount vs. what's actually visible in the table.
+        Total_Inverters=(inverter_col if inverter_col else df.columns[0], "count"),
         Total_Active_Strings=("Total Active Strings", "sum"),
         Total_Working_Strings=("Working String Count", "sum"),
         Total_Failed_Strings=("Failed String Count", "sum")
@@ -1884,7 +2134,11 @@ def main_dashboard_tab(df, sheet_df=None, sheet_name="Sheet1"):
 
     st.markdown("### <i class='fas fa-chart-line'></i> Key Performance Indicators", unsafe_allow_html=True)
 
-    total_inverters = df[inverter_col].nunique() if inverter_col and inverter_col in df.columns else 0
+    # "count" (non-null row count), NOT "nunique" - one row = one inverter
+    # per the sheet's contract, so this now matches the row count you see
+    # in the Data Table tab. nunique() previously collapsed any duplicate
+    # or blank Inverter ID values, silently undercounting.
+    total_inverters = df[inverter_col].count() if inverter_col and inverter_col in df.columns else 0
     total_strings = int(df["Total Active Strings"].sum()) if "Total Active Strings" in df.columns else 0
     working_strings = int(df["Working String Count"].sum()) if "Working String Count" in df.columns else 0
     failed_strings = int(df["Failed String Count"].sum()) if "Failed String Count" in df.columns else 0
@@ -1975,12 +2229,30 @@ def main_dashboard_tab(df, sheet_df=None, sheet_name="Sheet1"):
         col1, col2 = st.columns(2)
         with col1:
             csv = plot_summary.to_csv(index=False)
-            st.download_button(
-                label='Download Plot Summary (CSV)', data=csv,
-                file_name=f"plot_summary_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                mime="text/csv", use_container_width=True,
-                on_click=_log_download, args=("plot_summary_csv",),
-            )
+            pdl_col1, pdl_col2 = st.columns(2)
+            with pdl_col1:
+                st.download_button(
+                    label='Download (CSV)', data=csv,
+                    file_name=f"plot_summary_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                    mime="text/csv", use_container_width=True,
+                    on_click=_log_download, args=("plot_summary_csv",),
+                )
+            with pdl_col2:
+                plot_summary_colored_bytes = build_colored_excel(
+                    {"Plot Summary": display_plot_df},
+                    {"Plot Summary": {
+                        "Availability (%)": _availability_hex,
+                        "Health Status": _health_status_hex,
+                    }},
+                )
+                st.download_button(
+                    label='Download (Colored Excel)', data=plot_summary_colored_bytes,
+                    file_name=f"plot_summary_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                    key="download_plot_summary_colored_excel",
+                    on_click=_log_download, args=("plot_summary_colored_excel",),
+                )
         with col2:
             best_plot = plot_summary.loc[plot_summary["Availability (%)"].idxmax()]
             worst_plot = plot_summary.loc[plot_summary["Availability (%)"].idxmin()]
@@ -2062,31 +2334,31 @@ def main():
     if "authenticated" not in st.session_state:
         st.session_state.authenticated = False
 
+    # Try to silently restore a still-valid login from the URL's session
+    # token before deciding whether to show the login form. This is what
+    # keeps a user logged in for the rest of the day across page refreshes.
+    _try_restore_session()
+
     # ---------------- LOGIN ----------------
     if not st.session_state.authenticated:
-        st.markdown('<h1><i class="fas fa-sun" style="color:#fbbf24;"></i> Solar PV String Analytics</h1>', unsafe_allow_html=True)
-        st.markdown("### Login to access the dashboard")
+        st.markdown('<h1 class="login-title"><i class="fas fa-sun" style="color:#fbbf24;"></i> Solar PV String Analytics</h1>', unsafe_allow_html=True)
+        st.markdown('<p class="login-subtitle">Login to access the dashboard</p>', unsafe_allow_html=True)
 
-        col1, col2, col3 = st.columns([1, 1, 1])
-        with col2:
+        st.markdown('<div class="login-card">', unsafe_allow_html=True)
+        with st.form(key="login_form"):
             username = st.text_input("Username")
             password = st.text_input("Password", type="password")
+            submitted = st.form_submit_button("Login", use_container_width=True, type="primary")
 
-            if st.button("Login", use_container_width=True):
+            if submitted:
                 user_data = storage1.authenticate_user(username, password)
                 if user_data:
-                    st.session_state.user = {
-                        "username": username,
-                        "role": user_data["role"],
-                        "full_name": user_data.get("full_name", username),
-                        "assigned_plots": user_data.get("assigned_plots", []),
-                    }
-                    st.session_state.authenticated = True
+                    _login_user(username, user_data)  # also mints a session token that survives refresh
                     storage1.log_audit_event(username, user_data["role"], "login", {})
                     st.rerun()
                 else:
                     st.error("Invalid username or password")
-        st.markdown("---")
+        st.markdown('</div>', unsafe_allow_html=True)
         return
 
     # ---------------- AUTHENTICATED ----------------
@@ -2143,8 +2415,7 @@ def main():
 
     if st.sidebar.button("🚪 Logout", use_container_width=True):
         storage1.log_audit_event(current_user["username"], role, "logout", {})
-        st.session_state.authenticated = False
-        st.session_state.user = None
+        _logout_user()
         st.rerun()
 
     st.sidebar.markdown("---")
@@ -2183,6 +2454,9 @@ def main():
     st.sidebar.markdown("---")
 
     # ---- Load current data ----
+    # Always served from the already-preprocessed CSVs (the raw workbook is
+    # never stored, so there's nothing to re-parse here). "Current" is the
+    # snapshot with the most recent snapshot_date, per get_latest_upload().
     latest_upload = storage1.get_latest_upload()
     if not latest_upload:
         st.info("No SCADA file available. Please contact admin to upload one.")
@@ -2190,30 +2464,12 @@ def main():
 
     # ---- Header calendar: browse any previously preprocessed snapshot date ----
     selected_snapshot_date, using_latest = render_header_calendar()
+    target_snapshot_date = selected_snapshot_date or latest_upload["snapshot_date"]
 
-    if selected_snapshot_date and not using_latest:
-        processed_dataframes, snapshot_entry = storage1.get_processed_dataframes_for_date(selected_snapshot_date)
-        if not processed_dataframes:
-            st.warning(f"No preprocessed data could be loaded for {selected_snapshot_date}. Showing the latest snapshot instead.")
-            processed_dataframes = None
-    else:
-        processed_dataframes = None
-
-    if processed_dataframes is None:
-        file_bytes = storage1.load_original_bytes(latest_upload["upload_id"])
-        if not file_bytes:
-            st.error("Could not load file from backend storage")
-            return
-
-        # Use file hash for caching
-        file_hash = hashlib.md5(file_bytes).hexdigest()
-
-        processed_dataframes = process_scada_excel_with_status(
-            file_bytes, filename_hash=file_hash, source_label="Latest SCADA workbook"
-        )
-        if not processed_dataframes:
-            st.error("No valid sheets or inverter columns were identified in the uploaded workbook.")
-            return
+    processed_dataframes, snapshot_entry = storage1.get_processed_dataframes_for_date(target_snapshot_date)
+    if not processed_dataframes:
+        st.error(f"No preprocessed data could be loaded for {target_snapshot_date}.")
+        return
 
     if role == "engineer":
         allowed_plots = current_user.get("assigned_plots", [])
@@ -2308,13 +2564,37 @@ def main():
                 "Failure Percentage (%)": st.column_config.NumberColumn("Failure Percentage (%)", format="%.2f%%")
             })
 
-            download_bytes = create_excel_download({sheet_selection: filtered_df})
-            st.download_button(
-                label="Download Filtered Excel", data=download_bytes,
-                file_name=f"processed_{sheet_selection}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                on_click=_log_download, args=(f"filtered_excel:{sheet_selection}",),
-            )
+            tdl_col1, tdl_col2 = st.columns(2)
+            with tdl_col1:
+                download_bytes = create_excel_download({sheet_selection: filtered_df})
+                st.download_button(
+                    label="Download (Plain Excel)", data=download_bytes,
+                    file_name=f"processed_{sheet_selection}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                    on_click=_log_download, args=(f"filtered_excel:{sheet_selection}",),
+                )
+            with tdl_col2:
+                _pv_cur_cols, _ = get_pv_string_columns_cached(filtered_df)
+                table_color_rules = build_pv_current_color_rules(
+                    [c for c in _pv_cur_cols if c in filtered_df.columns]
+                )
+                if "Availability (%)" in filtered_df.columns:
+                    table_color_rules["Availability (%)"] = _availability_hex
+                if "Failed String Count" in filtered_df.columns:
+                    table_color_rules["Failed String Count"] = _failed_count_hex
+                table_colored_bytes = build_colored_excel(
+                    {sheet_selection: filtered_df},
+                    {sheet_selection: table_color_rules},
+                )
+                st.download_button(
+                    label="Download (Colored Excel)", data=table_colored_bytes,
+                    file_name=f"processed_{sheet_selection}_colored.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                    key=f"filtered_excel_colored_{sheet_selection}",
+                    on_click=_log_download, args=(f"filtered_excel_colored:{sheet_selection}",),
+                )
         else:
             st.info("No data available")
 
