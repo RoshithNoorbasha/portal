@@ -657,13 +657,13 @@ def display_negative_pv_values(df_result, sheet_name="Sheet1"):
         lambda _: "background-color: #7f1d1d; color: white; font-weight: 700;",
         subset=["PV Value"],
     )
-    st.dataframe(styled_negative, use_container_width=True, height=340)
+    st.dataframe(styled_negative, width='stretch', height=340)
     st.download_button(
         label="Download Negative PV Details (CSV)",
         data=df_negative_pv.to_csv(index=False),
         file_name=f"negative_pv_values_{sheet_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
         mime="text/csv",
-        use_container_width=True,
+        width='stretch',
         key=f"negative_pv_download_{sheet_name}",
     )
 
@@ -706,7 +706,7 @@ def user_management_ui():
         default_plots = storage1.ALL_PLOTS if new_role in ("admin", "manager") else storage1.ALL_PLOTS[:3]
         new_plots = st.multiselect("Assign Plots", storage1.ALL_PLOTS, default=default_plots, key="new_user_plots")
 
-        if st.button("➕ Create User", key="create_user_btn", use_container_width=True):
+        if st.button("➕ Create User", key="create_user_btn", width='stretch'):
             ok, msg = storage1.create_user(
                 username=new_username, password=new_password, role=new_role,
                 full_name=new_full_name, assigned_plots=new_plots,
@@ -824,7 +824,7 @@ def render_super_admin_panel(current_user, role):
             file_name=f"users_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
             mime="application/json",
             key="download_users_backup_btn",
-            use_container_width=True,
+            width='stretch',
             on_click=_log_download, args=("users_backup",),
         )
 
@@ -832,7 +832,7 @@ def render_super_admin_panel(current_user, role):
         st.caption("Only usernames absent from the current system are added back. Existing accounts are left untouched.")
         backup_upload = st.file_uploader("Upload backup file (.json)", type=["json"], key="users_backup_upload")
         if backup_upload is not None:
-            if st.button("Restore Missing Users", key="restore_users_backup_btn", use_container_width=True):
+            if st.button("Restore Missing Users", key="restore_users_backup_btn", width='stretch'):
                 ok, msg, restored = storage1.import_users_backup(backup_upload.getvalue())
                 if ok:
                     storage1.log_audit_event(
@@ -874,7 +874,7 @@ def render_super_admin_panel(current_user, role):
                             st.error(msg)
                         st.rerun()
 
-            if st.button("🗑️ Delete ALL Saved Backups", key="delete_all_backups_btn", use_container_width=True):
+            if st.button("🗑️ Delete ALL Saved Backups", key="delete_all_backups_btn", width='stretch'):
                 st.session_state.confirm_delete_all_backups = True
                 st.rerun()
 
@@ -882,14 +882,14 @@ def render_super_admin_panel(current_user, role):
                 st.warning("This will permanently delete every saved backup snapshot. This cannot be undone.")
                 cc1, cc2 = st.columns(2)
                 with cc1:
-                    if st.button("Yes, delete all", key="confirm_delete_all_backups_yes", use_container_width=True):
+                    if st.button("Yes, delete all", key="confirm_delete_all_backups_yes", width='stretch'):
                         ok, msg = storage1.delete_all_user_backups()
                         storage1.log_audit_event(current_user["username"], role, "all_backups_deleted", {})
                         st.success(msg)
                         del st.session_state.confirm_delete_all_backups
                         st.rerun()
                 with cc2:
-                    if st.button("Cancel", key="confirm_delete_all_backups_no", use_container_width=True):
+                    if st.button("Cancel", key="confirm_delete_all_backups_no", width='stretch'):
                         del st.session_state.confirm_delete_all_backups
                         st.rerun()
 
@@ -908,7 +908,7 @@ def render_super_admin_panel(current_user, role):
         )
         reset_disabled = reset_confirm_text.strip().upper() != "RESET"
         if st.button("🧨 Reset Application Data", key="reset_app_data_btn",
-                     use_container_width=True, disabled=reset_disabled, type="primary"):
+                     width='stretch', disabled=reset_disabled, type="primary"):
             ok, msg, details = storage1.reset_application_data()
             storage1.log_audit_event(current_user["username"], role, "application_reset", details)
             if ok:
@@ -974,7 +974,7 @@ def audit_log_tab():
         filtered = filtered[filtered["username"] == selected_user]
 
     st.caption(f"Showing {len(filtered)} of {len(df_audit)} event(s) you have access to.")
-    st.dataframe(filtered, use_container_width=True, height=450)
+    st.dataframe(filtered, width='stretch', height=450)
 
 # ==========================================
 # 7. UI - OPTIMIZED MAIN TABS WITH CACHING
@@ -1231,7 +1231,7 @@ def create_pv_string_tab(df):
             )
         with col8:
             st.write("")
-            search_clicked = st.form_submit_button("🔍 Search", use_container_width=True, type="primary")
+            search_clicked = st.form_submit_button("🔍 Search", width='stretch', type="primary")
 
     if search_clicked:
         st.session_state.pv_filters.update({
@@ -1324,7 +1324,7 @@ def create_pv_string_tab(df):
         st.markdown('<h3><i class="fas fa-table-list"></i> Inverter-wise Summary</h3>', unsafe_allow_html=True)
 
         styled_summary = get_styled_summary(summary_df)
-        st.dataframe(styled_summary, use_container_width=True)
+        st.dataframe(styled_summary, width='stretch')
 
         # DETAILED PV STRING DATA
         st.markdown("---")
@@ -1403,10 +1403,10 @@ def create_pv_string_tab(df):
         if not display_df.empty:
             try:
                 styled_df = apply_detailed_styling(display_df)
-                st.dataframe(styled_df, use_container_width=True, height=400)
+                st.dataframe(styled_df, width='stretch', height=400)
             except Exception as e:
                 st.warning(f"Styling error: {str(e)}. Showing unstyled data.")
-                st.dataframe(display_df, use_container_width=True, height=400)
+                st.dataframe(display_df, width='stretch', height=400)
 
     # ==========================================
     # TAB 2: INDIVIDUAL STRING DETAILS
@@ -1675,7 +1675,7 @@ def create_pv_string_tab(df):
                             return ''
 
                         styled_perf = perf_df.style.map(color_performance, subset=['Performance'])
-                        st.dataframe(styled_perf, use_container_width=True)
+                        st.dataframe(styled_perf, width='stretch')
 
                     if low_performance > 0 or negative_count > 0:
                         st.markdown("---")
@@ -1730,7 +1730,7 @@ def create_pv_string_tab(df):
             st.markdown("---")
             st.markdown('<h4><i class="fas fa-table-list"></i> Failed Inverter Summary</h4>', unsafe_allow_html=True)
             styled_failed_summary = get_styled_summary(failed_summary_df)
-            st.dataframe(styled_failed_summary, use_container_width=True)
+            st.dataframe(styled_failed_summary, width='stretch')
 
             st.markdown("---")
             st.markdown('<h4><i class="fas fa-bolt"></i> PV String Details for Failed Inverters</h4>', unsafe_allow_html=True)
@@ -1766,10 +1766,10 @@ def create_pv_string_tab(df):
                     styled_failed_detail = styled_failed_detail.map(color_availability, subset=['Availability (%)'])
                 if "Failed" in failed_detail_display.columns:
                     styled_failed_detail = styled_failed_detail.map(color_failed_strings, subset=['Failed'])
-                st.dataframe(styled_failed_detail, use_container_width=True, height=400)
+                st.dataframe(styled_failed_detail, width='stretch', height=400)
             except Exception as e:
                 st.warning(f"Styling error: {str(e)}. Showing unstyled data.")
-                st.dataframe(failed_detail_display, use_container_width=True, height=400)
+                st.dataframe(failed_detail_display, width='stretch', height=400)
 
             csv_failed = failed_detail_display.to_csv(index=False)
             st.download_button(
@@ -1986,17 +1986,17 @@ def main_dashboard_tab(df, sheet_df=None, sheet_name="Sheet1"):
 
     col1, col2 = st.columns([2, 1])
     with col1:
-        st.plotly_chart(charts["bar"], use_container_width=True, key="plot_bar")
+        st.plotly_chart(charts["bar"], width='stretch', key="plot_bar")
     with col2:
-        st.plotly_chart(charts["donut"], use_container_width=True, key="overall_donut")
+        st.plotly_chart(charts["donut"], width='stretch', key="overall_donut")
 
     col1, col2 = st.columns(2)
     with col1:
-        st.plotly_chart(charts["availability"], use_container_width=True, key="avail_bar")
+        st.plotly_chart(charts["availability"], width='stretch', key="avail_bar")
     with col2:
-        st.plotly_chart(charts["treemap"], use_container_width=True, key="plot_treemap")
+        st.plotly_chart(charts["treemap"], width='stretch', key="plot_treemap")
 
-    st.plotly_chart(charts["scatter"], use_container_width=True, key="plot_scatter")
+    st.plotly_chart(charts["scatter"], width='stretch', key="plot_scatter")
     st.markdown("---")
     st.markdown('<i class="fas fa-table"></i> Detailed Plot Summary', unsafe_allow_html=True)
 
@@ -2030,7 +2030,7 @@ def main_dashboard_tab(df, sheet_df=None, sheet_name="Sheet1"):
 
         styled_plot_df = styled_plot_df.map(availability_bar, subset=['Availability (%)'])
 
-        st.dataframe(styled_plot_df, use_container_width=True, column_config={
+        st.dataframe(styled_plot_df, width='stretch', column_config={
             "Plot": "Plot",
             "Total_Blocks": "Blocks",
             "Total_Inverters": "Inverters",
@@ -2048,7 +2048,7 @@ def main_dashboard_tab(df, sheet_df=None, sheet_name="Sheet1"):
             st.download_button(
                 label='Download Plot Summary (CSV)', data=csv,
                 file_name=f"plot_summary_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                mime="text/csv", use_container_width=True,
+                mime="text/csv", width='stretch',
                 on_click=_log_download, args=("plot_summary_csv",),
             )
         with col2:
@@ -2167,7 +2167,7 @@ def main():
             username = st.text_input("Username")
             password = st.text_input("Password", type="password")
 
-            if st.button("Login", use_container_width=True, type="primary"):
+            if st.button("Login", width='stretch', type="primary"):
                 user_data = storage1.authenticate_user(username, password)
                 if user_data:
                     st.session_state.user = {
@@ -2239,7 +2239,7 @@ def main():
 
     st.sidebar.markdown(f"**User:** {current_user['username']} ({ROLE_BADGES.get(role, role)})", unsafe_allow_html=True)
 
-    if st.sidebar.button("🚪 Logout", use_container_width=True):
+    if st.sidebar.button("🚪 Logout", width='stretch'):
         storage1.log_audit_event(current_user["username"], role, "logout", {})
         st.session_state.authenticated = False
         st.session_state.user = None
@@ -2401,7 +2401,7 @@ def main():
             if inverter_col and inverter_col != "Inverter ID":
                 display_df = display_df.rename(columns={inverter_col: "Inverter ID"})
 
-            st.dataframe(display_df, use_container_width=True, column_config={
+            st.dataframe(display_df, width='stretch', column_config={
                 "Availability (%)": st.column_config.ProgressColumn("Availability (%)", min_value=0, max_value=100, format="%.2f%%"),
                 "Failure Percentage (%)": st.column_config.NumberColumn("Failure Percentage (%)", format="%.2f%%")
             })
