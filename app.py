@@ -138,6 +138,76 @@ st.markdown("""
         border-radius: 16px;
         padding: 16px 18px 6px 18px;
     }
+
+    /* ---------- Login page ---------- */
+    .login-shell {
+        max-width: 1100px;
+        margin: 0 auto 1.5rem auto;
+    }
+    .login-title {
+        margin: 0 0 0.35rem 0;
+        font-size: 2rem;
+        color: #f8fafc;
+        font-weight: 800;
+    }
+    .login-subtitle {
+        margin: 0 0 1rem 0;
+        color: #94a3b8;
+        font-size: 0.95rem;
+    }
+    .login-feature-card {
+        background: linear-gradient(140deg, rgba(15, 23, 42, 0.95) 0%, rgba(14, 36, 57, 0.88) 100%);
+        border: 1px solid rgba(56, 189, 248, 0.22);
+        border-radius: 20px;
+        padding: 22px;
+        min-height: 100%;
+        box-shadow: 0 18px 42px rgba(2, 6, 23, 0.3);
+    }
+    .login-feature-title {
+        margin: 0 0 0.45rem 0;
+        color: #f8fafc;
+        font-weight: 700;
+        font-size: 1.05rem;
+    }
+    .login-feature-text {
+        margin: 0 0 0.9rem 0;
+        color: #cbd5e1;
+        font-size: 0.9rem;
+        line-height: 1.5;
+    }
+    .login-chip-row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+    }
+    .login-chip {
+        background: rgba(56, 189, 248, 0.14);
+        border: 1px solid rgba(56, 189, 248, 0.25);
+        color: #67e8f9;
+        border-radius: 999px;
+        padding: 5px 10px;
+        font-size: 0.75rem;
+        font-weight: 600;
+    }
+    .login-panel {
+        background: linear-gradient(145deg, rgba(15, 23, 42, 0.96) 0%, rgba(21, 36, 58, 0.88) 100%);
+        border: 1px solid rgba(148, 163, 184, 0.2);
+        border-radius: 20px;
+        padding: 22px;
+        min-height: 100%;
+        box-shadow: 0 18px 42px rgba(2, 6, 23, 0.3);
+    }
+    .login-panel-title {
+        margin: 0 0 0.25rem 0;
+        color: #f8fafc;
+        font-size: 1.1rem;
+        font-weight: 700;
+    }
+    .login-panel-subtitle {
+        margin: 0 0 1.1rem 0;
+        color: #94a3b8;
+        font-size: 0.84rem;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -2064,15 +2134,40 @@ def main():
 
     # ---------------- LOGIN ----------------
     if not st.session_state.authenticated:
-        st.markdown('<h1><i class="fas fa-sun" style="color:#fbbf24;"></i> Solar PV String Analytics</h1>', unsafe_allow_html=True)
-        st.markdown("### Login to access the dashboard")
+        st.markdown('<div class="login-shell">', unsafe_allow_html=True)
+        st.markdown('<h1 class="login-title"><i class="fas fa-sun" style="color:#fbbf24;"></i> Solar PV String Analytics</h1>', unsafe_allow_html=True)
+        st.markdown('<p class="login-subtitle">Securely sign in to monitor plant health, compare snapshots, and generate performance insights.</p>', unsafe_allow_html=True)
 
-        col1, col2, col3 = st.columns([1, 1, 1])
-        with col2:
+        info_col, login_col = st.columns([1.2, 1], gap="large")
+
+        with info_col:
+            st.markdown(
+                """
+                <div class="login-feature-card">
+                    <p class="login-feature-title">⚡ Intelligent PV Operations Hub</p>
+                    <p class="login-feature-text">
+                        Get instant visibility into string current behavior, negative string trends, and historical snapshot performance from one centralized dashboard.
+                    </p>
+                    <div class="login-chip-row">
+                        <span class="login-chip">Live Analytics</span>
+                        <span class="login-chip">Role-Based Access</span>
+                        <span class="login-chip">Audit Tracking</span>
+                        <span class="login-chip">Report Downloads</span>
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+        with login_col:
+            st.markdown('<div class="login-panel">', unsafe_allow_html=True)
+            st.markdown('<p class="login-panel-title">Welcome back</p>', unsafe_allow_html=True)
+            st.markdown('<p class="login-panel-subtitle">Enter your account credentials to continue.</p>', unsafe_allow_html=True)
+
             username = st.text_input("Username")
             password = st.text_input("Password", type="password")
 
-            if st.button("Login", use_container_width=True):
+            if st.button("Login", use_container_width=True, type="primary"):
                 user_data = storage1.authenticate_user(username, password)
                 if user_data:
                     st.session_state.user = {
@@ -2086,6 +2181,9 @@ def main():
                     st.rerun()
                 else:
                     st.error("Invalid username or password")
+            st.markdown('</div>', unsafe_allow_html=True)
+
+        st.markdown('</div>', unsafe_allow_html=True)
         st.markdown("---")
         return
 
