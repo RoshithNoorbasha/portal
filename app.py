@@ -2397,7 +2397,7 @@ def main():
         )
         col1, col2, col3 = st.columns([1, 1, 1])
         with col2:
-            if st.button("🚪 Logout", use_container_width=True, key="maintenance_logout"):
+            if st.button("Logout", use_container_width=True, key="maintenance_logout"):
                 storage1.log_audit_event(current_user["username"], role, "logout", {})
                 storage1.invalidate_session(st.session_state.get("session_token"))
                 try:
@@ -2452,7 +2452,7 @@ def main():
 
     st.sidebar.markdown(f"**User:** {current_user['username']} ({ROLE_BADGES.get(role, role)})", unsafe_allow_html=True)
 
-    if st.sidebar.button("🚪 Logout", use_container_width=True):
+    if st.sidebar.button(" Logout", use_container_width=True):
         storage1.log_audit_event(current_user["username"], role, "logout", {})
         storage1.invalidate_session(st.session_state.get("session_token"))
         try:
