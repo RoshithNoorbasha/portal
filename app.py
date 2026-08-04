@@ -2381,20 +2381,19 @@ def main():
     if maintenance.get("enabled") and not is_super:
         st.markdown(
             f"""
-            <div style="display:flex; align-items:center; justify-content:center; min-height:65vh;">
-              <div style="max-width:480px; text-align:center; background: rgba(15,23,42,0.75);
-                          border: 1px solid rgba(251,191,36,0.35); border-radius:20px; padding:36px 28px;">
-                <div style="font-size:2.6rem;">🚧</div>
-                <div style="font-size:1.3rem; font-weight:700; color:#f8fafc; margin-top:8px;">
-                    Dear Sir/Madam,
-                </div>
-                <div style="font-size:1.05rem; color:#cbd5e1; margin-top:6px;">
-                    {maintenance.get("message") or storage1.DEFAULT_MAINTENANCE_MESSAGE}
-                </div>
-              </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
+    <div style="display:flex; align-items:center; justify-content:center; min-height:65vh;">
+      <div style="max-width:480px; text-align:center; background: rgba(15,23,42,0.75);
+                  border: 1px solid rgba(251,191,36,0.35); border-radius:20px; padding:36px 28px;">
+        <div style="font-size:2.6rem;">🚧</div>
+        <div style="font-size:1.4rem; font-weight:700; color:#f8fafc; margin-top:8px; letter-spacing:0.5px;">
+            System Maintenance
+        </div>
+        <div style="font-size:1.05rem; color:#cbd5e1; margin-top:8px; line-height:1.5;">
+            {maintenance.get("message") or storage1.DEFAULT_MAINTENANCE_MESSAGE}
+        </div>
+      </div>
+    </div>
+    """, unsafe_allow_html=True,
         )
         col1, col2, col3 = st.columns([1, 1, 1])
         with col2:
