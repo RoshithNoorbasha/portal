@@ -1993,15 +1993,9 @@ def calculate_plot_summary_cached(df, inverter_col):
     if df.empty:
         return pd.DataFrame()
 
-    # Count each physical inverter once per Plot+Block+ID combination -
-    # plain nunique(inverter_col) per Plot still undercounts when the same
-    # inverter ID repeats across different Blocks of the same Plot (common
-    # SCADA numbering), which is what was making the dashboard's inverter
-    # counts wrong while the PV String Details tab / Data Table (which
-    # already treat each row as one physical inverter) were correct.
-    id_cols = [c for c in ["Plot", "Block", inverter_col] if c and c in df.columns]
-    dedup_df = df.drop_duplicates(subset=id_cols) if id_cols else df
-    inverter_counts = dedup_df.groupby("Plot").size().reset_index(name="Total_Inverters")
+    # Match the PV String Details summary and Data Table: each processed row is
+    # one physical inverter, even when the displayed inverter ID repeats.
+    inverter_counts = df.groupby("Plot").size().reset_index(name="Total_Inverters")
 
     plot_summary = df.groupby("Plot", as_index=False).agg(
         Total_Active_Strings=("Total Active Strings", "sum"),
@@ -2130,8 +2124,7 @@ def main_dashboard_tab(df, sheet_df=None, sheet_name="Sheet1"):
 
     st.markdown("### <i class='fas fa-chart-line'></i> Key Performance Indicators", unsafe_allow_html=True)
 
-    id_cols_present = [c for c in ["Plot", "Block", inverter_col] if c and c in df.columns]
-    total_inverters = df.drop_duplicates(subset=id_cols_present).shape[0] if id_cols_present else 0
+    total_inverters = int(len(df))
     total_strings = int(df["Total Active Strings"].sum()) if "Total Active Strings" in df.columns else 0
     working_strings = int(df["Working String Count"].sum()) if "Working String Count" in df.columns else 0
     failed_strings = int(df["Failed String Count"].sum()) if "Failed String Count" in df.columns else 0
