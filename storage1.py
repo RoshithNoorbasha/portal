@@ -10,23 +10,15 @@ Sections:
   2. User management incl. roles   (data/users.json)
   3. Hash-chained audit log        (data/audit_log.json)
   4. Super-admin user-data backup / restore (data/backups)
-  5. Login session tokens          (data/sessions.json)
 
 Having ONE registry file for uploads means:
   - app.py always knows what the "current" (latest) file is.
   - restore.py can compare any two calendar dates without re-uploading,
     because every upload's processed sheets are already saved as CSV.
-
-STORAGE NOTE: the original uploaded .xlsx is used only in-memory (to hash
-it for de-dup and to parse it into per-sheet CSVs). It is never written to
-disk. Only the processed CSVs are persisted, since that is all the app
-actually needs to render dashboards/history - keeping the original around
-too would roughly double storage for no benefit.
 """
 
 import hashlib
 import json
-import secrets
 import time
 from datetime import datetime
 from functools import lru_cache
@@ -46,12 +38,11 @@ PREPROCESS_REGISTRY_FILE = PREPROCESS_DIR / "registry.json"
 
 USERS_FILE = DATA_DIR / "users.json"
 AUDIT_FILE = DATA_DIR / "audit_log.json"
+SESSIONS_FILE = DATA_DIR / "sessions.json"
+MAINTENANCE_FILE = DATA_DIR / "maintenance.json"
 
 BACKUP_DIR = DATA_DIR / "backups"
 BACKUP_DIR.mkdir(exist_ok=True)
-
-SESSIONS_FILE = DATA_DIR / "sessions.json"
-SESSION_TTL_SECONDS = 24 * 60 * 60  # a login stays valid for 1 day, even across page refreshes
 
 # ==========================================
 # UPLOAD LOCK - Prevent concurrent uploads
@@ -137,6 +128,124 @@ def _invalidate_cache():
     _JSON_CACHE = {}
 
 # ==========================================
+# 0. LOGIN SESSIONS (persist across page refresh, valid for the same day)
+# ==========================================
+# Streamlit's st.session_state is tied to the browser websocket connection -
+# it is wiped out on a hard page refresh (F5), forcing the user to log in
+# again. To avoid that, we hand back a random session token that the
+# frontend keeps in the URL (st.query_params), and validate it against this
+# server-side registry on every rerun. A session is valid until local
+# midnight of the day it was created - after that it must be re-created via
+# a fresh login, even if the token is still present in the URL.
+import secrets
+
+
+def _load_sessions():
+    data = _read_json(SESSIONS_FILE, {"sessions": {}})
+    if "sessions" not in data:
+        data["sessions"] = {}
+    return data
+
+
+def _save_sessions(data):
+    _write_json(SESSIONS_FILE, data)
+
+
+def _end_of_today_iso():
+    now = datetime.now()
+    end_of_day = now.replace(hour=23, minute=59, second=59, microsecond=0)
+    return end_of_day.isoformat()
+
+
+def create_session(username):
+    """Create a new login session token, valid until the end of today."""
+    data = _load_sessions()
+    token = secrets.token_urlsafe(24)
+    data["sessions"][token] = {
+        "username": username,
+        "created_at": datetime.now().isoformat(),
+        "expires_at": _end_of_today_iso(),
+    }
+    _save_sessions(data)
+    return token
+
+
+def validate_session(token):
+    """Return the username for a still-valid session token, else None.
+    Expired/unknown sessions are cleaned up as they're encountered."""
+    if not token:
+        return None
+    data = _load_sessions()
+    session = data["sessions"].get(token)
+    if not session:
+        return None
+    try:
+        expires_at = datetime.fromisoformat(session["expires_at"])
+    except Exception:
+        expires_at = None
+    if expires_at is not None and datetime.now() > expires_at:
+        del data["sessions"][token]
+        _save_sessions(data)
+        return None
+    return session.get("username")
+
+
+def invalidate_session(token):
+    """Remove a session token (used on logout)."""
+    if not token:
+        return
+    data = _load_sessions()
+    if token in data["sessions"]:
+        del data["sessions"][token]
+        _save_sessions(data)
+
+
+def cleanup_expired_sessions():
+    """Drop every session token that has already expired."""
+    data = _load_sessions()
+    now = datetime.now()
+    kept = {}
+    for token, session in data["sessions"].items():
+        try:
+            expires_at = datetime.fromisoformat(session["expires_at"])
+        except Exception:
+            continue
+        if now <= expires_at:
+            kept[token] = session
+    data["sessions"] = kept
+    _save_sessions(data)
+
+
+# ==========================================
+# MAINTENANCE MODE (super admin only)
+# ==========================================
+DEFAULT_MAINTENANCE_MESSAGE = "Dear Sir, we are under maintenance. Please wait."
+
+
+def get_maintenance_status():
+    """Returns dict: {enabled: bool, message: str, enabled_by: str|None, enabled_at: str|None}."""
+    data = _read_json(MAINTENANCE_FILE, {
+        "enabled": False,
+        "message": DEFAULT_MAINTENANCE_MESSAGE,
+        "enabled_by": None,
+        "enabled_at": None,
+    })
+    data.setdefault("message", DEFAULT_MAINTENANCE_MESSAGE)
+    return data
+
+
+def set_maintenance_mode(enabled, username, message=None):
+    """Super-admin-only: turn maintenance mode on/off, optionally with a custom message."""
+    data = {
+        "enabled": bool(enabled),
+        "message": message or DEFAULT_MAINTENANCE_MESSAGE,
+        "enabled_by": username if enabled else None,
+        "enabled_at": datetime.now().isoformat() if enabled else None,
+    }
+    _write_json(MAINTENANCE_FILE, data)
+    return data
+
+# ==========================================
 # 1. PREPROCESSED UPLOAD REGISTRY
 # ==========================================
 def _load_registry():
@@ -154,13 +263,8 @@ def _save_registry(data):
 def save_preprocessed_upload(file_bytes, original_filename, processed_dataframes,
                               snapshot_date, uploaded_by):
     """
-    Persist a newly processed SCADA workbook.
-    Ensures only ONE snapshot is stored per snapshot_date.
-
-    STORAGE OPTIMIZATION: only the processed per-sheet CSVs are written to
-    disk. `file_bytes` is used in-memory to compute a de-dup hash, but the
-    raw workbook itself is never saved - the processed CSVs are all the
-    app needs to render dashboards, history, and TAT comparisons.
+    Persist a newly uploaded + processed SCADA workbook.
+    Ensures only ONE file is stored per snapshot_date.
     """
     # Acquire lock to prevent concurrent uploads
     if not _acquire_upload_lock():
@@ -206,8 +310,16 @@ def save_preprocessed_upload(file_bytes, original_filename, processed_dataframes
         upload_path = PREPROCESS_DIR / upload_id
         upload_path.mkdir(parents=True, exist_ok=True)
 
-        # NOTE: the original workbook is intentionally NOT written to disk -
-        # only the processed per-sheet CSVs are persisted (storage optimization).
+        # STORAGE OPTIMIZATION: the original uploaded .xlsx is intentionally
+        # NOT written to disk. Only the processed (preprocessed) CSV sheets
+        # are persisted - they're all the app ever needs to render dashboards
+        # or history, and skipping the raw workbook avoids storing two
+        # copies of the same data. `file_bytes` is only used in-memory here
+        # (for hashing/dedup detection) and by the caller for the current
+        # request; it is never written to `data/preprocessed/<upload_id>/`.
+        ext = Path(original_filename).suffix or ".xlsx"
+
+        # Save processed sheets
         saved_sheets = []
         for sheet_name, df in processed_dataframes.items():
             if df is not None and not df.empty:
@@ -219,6 +331,7 @@ def save_preprocessed_upload(file_bytes, original_filename, processed_dataframes
         entry = {
             "upload_id": upload_id,
             "original_filename": original_filename,
+            "original_ext": ext,
             "upload_timestamp": timestamp.strftime("%Y-%m-%d %H:%M:%S"),
             "snapshot_date": snapshot_date_str,
             "file_hash": file_hash,
@@ -249,16 +362,18 @@ def get_all_uploads():
 
 
 def get_latest_upload():
-    """
-    The "current" upload is defined by the most recent snapshot_date, NOT
-    the most recent upload_timestamp. Otherwise a backfilled upload for an
-    older date (uploaded after a more recent one) would wrongly become
-    "current" just because it was saved last.
-    """
+    """The 'current' snapshot is the one with the latest snapshot_date, not
+    simply the most recently-uploaded entry - otherwise backfilling an older
+    calendar date (Restore & TAT -> Upload Registry) would incorrectly
+    become the 'latest' snapshot shown across the app just because it was
+    uploaded most recently in wall-clock time."""
     uploads = get_all_uploads()
     if not uploads:
         return None
-    return max(uploads, key=lambda u: (u.get("snapshot_date", ""), u.get("upload_timestamp", "")))
+    return max(
+        uploads,
+        key=lambda u: (str(u.get("snapshot_date", "")), str(u.get("upload_timestamp", ""))),
+    )
 
 
 def get_upload_by_id(upload_id):
@@ -274,6 +389,20 @@ def get_upload_for_date(snapshot_date):
     if not matches:
         return None
     return sorted(matches, key=lambda x: x["upload_timestamp"])[-1]
+
+
+@lru_cache(maxsize=32)
+def _read_bytes_cached(path_str, mtime):
+    with open(path_str, "rb") as f:
+        return f.read()
+
+
+def load_original_bytes(upload_id):
+    """The original uploaded workbook is no longer stored on disk (only the
+    processed CSV sheets are, for storage optimization) - this always
+    returns None now. Kept only so any older caller doesn't hard-crash;
+    use get_processed_dataframes_for_date() / load_sheet_csv() instead."""
+    return None
 
 
 @lru_cache(maxsize=256)
@@ -298,9 +427,8 @@ def get_processed_dataframes_for_date(snapshot_date):
     """
     Load every already-preprocessed sheet that was saved for a given calendar
     date, straight from the CSV cache (no re-parsing of the original workbook
-    needed - the original isn't stored at all). Powers the header "calendar"
-    selector on the main dashboard so users can jump between previously
-    uploaded snapshots.
+    needed). Powers the header "calendar" selector on the main dashboard so
+    users can jump between previously uploaded snapshots.
     Returns (dict[sheet_name -> DataFrame] or None, registry entry or None).
     """
     entry = get_upload_for_date(snapshot_date)
@@ -316,18 +444,16 @@ def get_processed_dataframes_for_date(snapshot_date):
 
 def verify_upload_integrity(upload_id):
     """
-    Confirm that a registry entry's underlying sheet CSVs actually exist on
-    disk. Redeploys/volume resets can leave a "ghost" registry entry with no
-    backing files, which otherwise fails silently deep inside pandas.
-    Returns (is_ok: bool, message: str).
+    Confirm that a registry entry's underlying files actually exist on disk
+    (original workbook + every saved sheet CSV). Redeploys/volume resets can
+    leave a "ghost" registry entry with no backing files, which otherwise
+    fails silently deep inside pandas. Returns (is_ok: bool, message: str).
     """
     entry = get_upload_by_id(upload_id)
     if not entry:
         return False, "Not found in registry"
 
     upload_path = PREPROCESS_DIR / upload_id
-    if not upload_path.exists():
-        return False, "Upload folder missing on disk"
 
     missing_sheets = []
     for sheet_name in entry.get("saved_sheets", []):
@@ -348,6 +474,33 @@ def get_upload_registry_report():
         ok, msg = verify_upload_integrity(entry["upload_id"])
         report.append({**entry, "integrity_ok": ok, "integrity_message": msg})
     return report
+
+
+def delete_upload(upload_id):
+    """Admin-only: permanently delete one snapshot's saved CSVs and remove
+    it from the registry. Returns (success: bool, message: str)."""
+    registry = _load_registry()
+    match_idx = None
+    for idx, u in enumerate(registry["uploads"]):
+        if u.get("upload_id") == upload_id:
+            match_idx = idx
+            break
+
+    if match_idx is None:
+        return False, "Snapshot not found in registry."
+
+    entry = registry["uploads"][match_idx]
+    upload_path = PREPROCESS_DIR / upload_id
+    try:
+        if upload_path.exists():
+            import shutil
+            shutil.rmtree(upload_path, ignore_errors=True)
+    except Exception as exc:
+        return False, f"Could not delete files on disk: {exc}"
+
+    del registry["uploads"][match_idx]
+    _save_registry(registry)
+    return True, f"Deleted snapshot for {entry.get('snapshot_date', upload_id)}."
 
 
 # ==========================================
@@ -752,75 +905,39 @@ def get_audit_log_for(username, role):
     return []
 
 
-def clear_audit_log():
+def delete_audit_entries(entry_hashes):
     """
-    Super-admin-only: wipe the ENTIRE audit log.
-
-    Individual entries can't be deleted one at a time because the log is
-    hash-chained for tamper-evidence - each entry's hash depends on the
-    previous entry's hash, so silently removing one entry from the middle
-    would either break the chain (making verify_audit_chain() falsely
-    report tampering) or require silently re-chaining the remaining
-    entries (which defeats the point of a tamper-evident log). A full
-    clear is the only operation that preserves that guarantee.
+    Super-admin-only: permanently remove one or more audit log entries
+    (identified by their entry_hash) belonging to ANY user, then rebuild
+    the hash chain for everything that remains so verify_audit_chain()
+    still reports the log as intact.
+    Returns (success: bool, message: str, deleted_count: int).
     """
-    _save_audit({"entries": []})
-    return True, "Audit log cleared."
+    if not entry_hashes:
+        return False, "No entries selected.", 0
 
+    to_delete = set(entry_hashes)
+    data = _load_audit()
+    entries = data.get("entries", [])
 
-# ==========================================
-# 5. LOGIN SESSION TOKENS
-# ==========================================
-# Streamlit's st.session_state does not survive a browser refresh (a
-# refresh opens a brand-new session). To keep a user logged in for the
-# rest of the day even after a refresh, we hand out an opaque token that
-# app.py stores in the URL's query params and looks up here on load.
-def _load_sessions():
-    data = _read_json(SESSIONS_FILE, {})
-    return data if isinstance(data, dict) else {}
+    kept = [e for e in entries if e.get("entry_hash") not in to_delete]
+    deleted_count = len(entries) - len(kept)
 
+    if deleted_count == 0:
+        return False, "None of the selected entries were found.", 0
 
-def _save_sessions(sessions):
-    _write_json(SESSIONS_FILE, sessions)
-    _invalidate_cache()
+    # Rebuild the prev_hash / entry_hash chain over the surviving entries so
+    # the chain stays internally consistent (each entry's hash still
+    # depends on the previous surviving entry, not the deleted ones).
+    rebuilt = []
+    prev_hash = "0"
+    for e in kept:
+        body = {k: v for k, v in e.items() if k != "entry_hash"}
+        body["prev_hash"] = prev_hash
+        body["entry_hash"] = _entry_hash(body)
+        rebuilt.append(body)
+        prev_hash = body["entry_hash"]
 
-
-def _purge_expired_sessions(sessions):
-    now = time.time()
-    return {tok: s for tok, s in sessions.items() if s.get("expires_at", 0) > now}
-
-
-def create_session(username):
-    """Create a new login session token, valid for SESSION_TTL_SECONDS (1 day)."""
-    sessions = _purge_expired_sessions(_load_sessions())
-    token = secrets.token_urlsafe(32)
-    sessions[token] = {
-        "username": username,
-        "created_at": time.time(),
-        "expires_at": time.time() + SESSION_TTL_SECONDS,
-    }
-    _save_sessions(sessions)
-    return token
-
-
-def get_session_user(token):
-    """Return the username for a still-valid session token, or None."""
-    if not token:
-        return None
-    sessions = _load_sessions()
-    entry = sessions.get(token)
-    if not entry:
-        return None
-    if entry.get("expires_at", 0) < time.time():
-        return None
-    return entry.get("username")
-
-
-def delete_session(token):
-    """Invalidate a session token (used on logout)."""
-    if not token:
-        return
-    sessions = _load_sessions()
-    if token in sessions:
-        del sessions[token]
-        _save_sessions(sessions)
+    data["entries"] = rebuilt
+    _save_audit(data)
+    return True, f"Deleted {deleted_count} audit log entr{'y' if deleted_count == 1 else 'ies'}.", deleted_count

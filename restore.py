@@ -8,6 +8,7 @@ history matrix, working hours reference, and calendar comparison.
 """
 
 import json
+import io
 from datetime import datetime, timedelta
 from pathlib import Path
 import hashlib
@@ -298,6 +299,201 @@ def get_snapshots_in_range(from_date, to_date):
 
 
 # ==========================================
+# BLOCK -> INVERTER WORKING/FAILED MATRIX (day-wise), built straight from
+# the preprocessed CSV snapshots - it does NOT need string_history.json.
+# Each day's CSV already has each inverter's PV-I currents, which is all
+# that's needed to classify that inverter as working/failed for that day,
+# so this reads the daily snapshots directly instead of a separate
+# cumulative history file.
+# ==========================================
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
+def build_inverter_history_matrix(plot, block, date_start_str, date_end_str, max_dates, sheet_name="Sheet1"):
+    """
+    For a given Plot+Block, returns (df_matrix, dates_sorted):
+      df_matrix: one row per inverter, one column per date, cell = "Working"/"Failed"/"No Data"
+                 (an inverter counts as Working for a date if it has at least one PV string
+                 above the working-current threshold that day).
+      dates_sorted: the date columns used, oldest -> newest.
+    Also returns a per-date working/failed COUNT summary for the block.
+    """
+    available_dates = get_available_snapshot_dates()
+    dates_in_range = [
+        d for d in available_dates
+        if (not date_start_str or d >= date_start_str) and (not date_end_str or d <= date_end_str)
+    ]
+    dates_sorted = sorted(dates_in_range)[-max_dates:] if max_dates else sorted(dates_in_range)
+
+    inverter_status_by_date = {}  # {inverter_id: {date: "Working"/"Failed"}}
+    inverter_meta = {}
+
+    for date_str in dates_sorted:
+        day_df = load_snapshot_sheet(date_str, sheet_name)
+        if day_df is None or day_df.empty:
+            continue
+        inverter_col = get_inverter_column(day_df)
+        if not inverter_col:
+            continue
+        if "Plot" in day_df.columns:
+            day_df = day_df[day_df["Plot"].astype(str).str.strip() == str(plot).strip()]
+        if "Block" in day_df.columns:
+            day_df = day_df[day_df["Block"].astype(str).str.strip() == str(block).strip()]
+        if day_df.empty:
+            continue
+
+        pv_cols = get_pv_current_columns(day_df)
+        for _, row in day_df.iterrows():
+            inv_id = str(row[inverter_col])
+            numeric_vals = pd.to_numeric(row[pv_cols], errors="coerce") if pv_cols else pd.Series(dtype=float)
+            has_working = (numeric_vals > WORKING_CURRENT_THRESHOLD).any() if len(numeric_vals) else False
+            inverter_status_by_date.setdefault(inv_id, {})[date_str] = "Working" if has_working else "Failed"
+            inverter_meta.setdefault(inv_id, {"sacu": str(row.get("SACU", ""))})
+
+    if not inverter_status_by_date:
+        return pd.DataFrame(), [], pd.DataFrame()
+
+    rows = []
+    for inv_id in sorted(inverter_status_by_date.keys()):
+        row = {"Inverter": inv_id, "SACU": inverter_meta.get(inv_id, {}).get("sacu", "")}
+        for date_str in dates_sorted:
+            row[date_str] = inverter_status_by_date[inv_id].get(date_str, "No Data")
+        rows.append(row)
+    df_matrix = pd.DataFrame(rows)
+
+    # Per-date working/failed counts for the block (for a summary chart)
+    count_rows = []
+    for date_str in dates_sorted:
+        working = sum(1 for inv_id in inverter_status_by_date if inverter_status_by_date[inv_id].get(date_str) == "Working")
+        failed = sum(1 for inv_id in inverter_status_by_date if inverter_status_by_date[inv_id].get(date_str) == "Failed")
+        count_rows.append({"Date": date_str, "Working": working, "Failed": failed})
+    df_counts = pd.DataFrame(count_rows)
+
+    return df_matrix, dates_sorted, df_counts
+
+
+def display_inverter_history_matrix():
+    """New tab: Block-wise inverter working/failed history, built directly
+    from preprocessed snapshots (answers 'is string_history.json mandatory?'
+    - no, this view proves the daily CSVs alone are enough)."""
+    st.subheader("Inverter History Matrix (Block-wise)")
+    st.caption(
+        "Each inverter's working/failed status, day-wise, for one Block - read directly "
+        "from the preprocessed daily snapshots. Green = Working, Red = Failed, Gray = No Data."
+    )
+
+    available_dates = get_available_snapshot_dates()
+    if not available_dates:
+        st.info("No snapshot data available yet.")
+        return
+
+    # Build the Plot/Block choice list from the most recent snapshot
+    latest_df = load_snapshot_sheet(available_dates[-1], "Sheet1")
+    if latest_df is None or latest_df.empty or "Plot" not in latest_df.columns:
+        st.info("Could not read Plot/Block list from the latest snapshot.")
+        return
+
+    col1, col2 = st.columns(2)
+    with col1:
+        plots = sorted_filter_options(latest_df["Plot"])
+        selected_plot = st.selectbox("Plot (required)", plots, key="inv_matrix_plot") if plots else None
+
+    blocks_df = latest_df[latest_df["Plot"] == selected_plot] if selected_plot else latest_df
+    with col2:
+        blocks = sorted_filter_options(blocks_df["Block"]) if "Block" in blocks_df.columns else []
+        selected_block = st.selectbox("Block (required)", blocks, key="inv_matrix_block") if blocks else None
+
+    if not selected_plot or not selected_block:
+        st.info("Select a **Plot** and a **Block** to build the matrix.")
+        return
+
+    col3, col4 = st.columns(2)
+    with col3:
+        min_date = datetime.strptime(available_dates[0], "%Y-%m-%d").date()
+        max_date = datetime.strptime(available_dates[-1], "%Y-%m-%d").date()
+        date_range = st.date_input(
+            "Date Range", value=(min_date, max_date),
+            min_value=min_date, max_value=max_date, key="inv_matrix_date_range",
+        )
+    with col4:
+        max_dates_shown = st.slider("Most recent dates to show", min_value=5, max_value=60, value=30, key="inv_matrix_max_dates")
+
+    date_start, date_end = (None, None)
+    if isinstance(date_range, (list, tuple)) and len(date_range) == 2:
+        date_start, date_end = date_range
+
+    with st.spinner("Building inverter history matrix from preprocessed snapshots..."):
+        df_matrix, dates_sorted, df_counts = build_inverter_history_matrix(
+            selected_plot, selected_block,
+            str(date_start) if date_start else None, str(date_end) if date_end else None,
+            max_dates_shown,
+        )
+
+    if df_matrix.empty:
+        st.info("No matrix data available for the selected Plot/Block/date range.")
+        return
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Inverters", len(df_matrix))
+    m2.metric("Dates Shown", len(dates_sorted))
+    if not df_counts.empty:
+        m3.metric("Working Today (latest date)", int(df_counts.iloc[-1]["Working"]))
+
+    if not df_counts.empty:
+        st.markdown("##### Working vs Failed Inverters, Date-wise")
+        st.bar_chart(df_counts.set_index("Date")[["Working", "Failed"]])
+
+    def color_inv_status(val):
+        if val == "Working":
+            return "background-color: #10b981; color: white; font-weight: bold;"
+        if val == "Failed":
+            return "background-color: #ef4444; color: white; font-weight: bold;"
+        return "background-color: #64748b; color: white;"
+
+    st.markdown("##### Inverter x Date Matrix")
+    date_cols = [c for c in df_matrix.columns if c not in ("Inverter", "SACU")]
+    st.dataframe(
+        df_matrix.style.map(color_inv_status, subset=date_cols),
+        use_container_width=True, height=450,
+    )
+
+    # ---- Colorful Excel export ----
+    from openpyxl.styles import PatternFill, Font
+    status_fill = {
+        "Working": PatternFill("solid", fgColor="10B981"),
+        "Failed": PatternFill("solid", fgColor="EF4444"),
+        "No Data": PatternFill("solid", fgColor="64748B"),
+    }
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        df_matrix.to_excel(writer, sheet_name="Inverter Matrix", index=False)
+        ws = writer.sheets["Inverter Matrix"]
+        header_fill = PatternFill("solid", fgColor="1E293B")
+        header_font = Font(bold=True, color="FFFFFF")
+        for cell in ws[1]:
+            cell.fill = header_fill
+            cell.font = header_font
+        col_letters = {col: idx + 1 for idx, col in enumerate(df_matrix.columns)}
+        for row_idx in range(2, ws.max_row + 1):
+            for col_name in date_cols:
+                col_idx = col_letters[col_name]
+                cell = ws.cell(row=row_idx, column=col_idx)
+                fill = status_fill.get(cell.value)
+                if fill:
+                    cell.fill = fill
+                    cell.font = Font(bold=True, color="FFFFFF")
+        if not df_counts.empty:
+            df_counts.to_excel(writer, sheet_name="Date-wise Counts", index=False)
+    buffer.seek(0)
+
+    st.download_button(
+        label="Download Inverter History Matrix (Excel, color-coded)",
+        data=buffer.getvalue(),
+        file_name=f"inverter_history_matrix_{selected_plot}_{selected_block}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key="download_inverter_matrix_xlsx",
+    )
+
+
+# ==========================================
 # BLOCK -> INVERTER -> STRING HISTORY MATRIX (day-wise)
 # ==========================================
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
@@ -419,20 +615,24 @@ def display_string_history_matrix(history, current_df):
     df_inverters = pd.DataFrame(inverter_data)
 
     # ---- Filters ----
+    # Plot and Block are now REQUIRED (no "All") - building the matrix across
+    # every plot/block at once was the slow part of this tab, since it had
+    # to walk the full status history for every string in the whole plant.
+    # SACU/Inverter stay optional narrowing filters once Plot+Block are set.
     col1, col2, col3, col4 = st.columns(4)
     with col1:
-        plots = ["All"] + sorted_filter_options(df_inverters["plot"])
-        selected_plot = st.selectbox("Plot", plots, key="matrix_plot")
+        plots = sorted_filter_options(df_inverters["plot"])
+        selected_plot = st.selectbox("Plot (required)", plots, key="matrix_plot") if plots else None
 
     filtered_inverters = df_inverters.copy()
-    if selected_plot != "All":
+    if selected_plot:
         filtered_inverters = filtered_inverters[filtered_inverters["plot"] == selected_plot]
 
     with col2:
-        blocks = ["All"] + sorted_filter_options(filtered_inverters["block"])
-        selected_block = st.selectbox("Block", blocks, key="matrix_block")
+        blocks = sorted_filter_options(filtered_inverters["block"])
+        selected_block = st.selectbox("Block (required)", blocks, key="matrix_block") if blocks else None
 
-    if selected_block != "All":
+    if selected_block:
         filtered_inverters = filtered_inverters[filtered_inverters["block"] == selected_block]
 
     with col3:
@@ -445,6 +645,10 @@ def display_string_history_matrix(history, current_df):
     with col4:
         inverters = ["All"] + sorted_filter_options(filtered_inverters["inverter"])
         selected_inverter = st.selectbox("Inverter", inverters, key="matrix_inverter")
+
+    if not selected_plot or not selected_block:
+        st.info("Select a **Plot** and a **Block** above to build the matrix - this keeps it fast by only loading that block's strings instead of the whole plant.")
+        return
 
     col5, col6, col7 = st.columns(3)
     with col5:
@@ -565,6 +769,16 @@ def compare_two_snapshots_by_date_cached(old_date, new_date, sheet_name="Sheet1"
     df_old_prep = df_old[required_cols].copy()
     df_new_prep = df_new[required_cols].copy()
 
+    # Normalize the join keys - SCADA exports frequently have inconsistent
+    # whitespace between two dates' workbooks (e.g. "Block 1" vs "Block 1 "),
+    # which used to make the outer merge below treat the same inverter as
+    # two different rows, silently corrupting the comparison. Also drop any
+    # exact-duplicate id rows so the merge can't fan out into duplicates.
+    for prep_df in (df_old_prep, df_new_prep):
+        for col in id_cols:
+            prep_df[col] = prep_df[col].astype(str).str.strip()
+        prep_df.drop_duplicates(subset=id_cols, keep="last", inplace=True)
+
     rename_cols = pv_cols + ["Failed String Count", "Total Active Strings", "Working String Count"]
     for col in rename_cols:
         df_old_prep.rename(columns={col: f"{col}_old"}, inplace=True)
@@ -643,10 +857,6 @@ def compare_two_snapshots_by_date_cached(old_date, new_date, sheet_name="Sheet1"
                         "Total Active Strings_old", "Total Active Strings_new",
                         "Working String Count_old", "Working String Count_new"]
     df_history = pd.merge(df_history, merged_df[merge_back_cols], on=["Plot", "Block", inverter_col], how="left")
-
-    df_history["Lost_Current_Old"] = df_history["Failed String Count_old"] * baseline_avg_working_current
-    df_history["Lost_Current_New"] = df_history["Failed String Count_new"] * baseline_avg_working_current
-    df_history["Change_Lost_Current"] = df_history["Lost_Current_New"] - df_history["Lost_Current_Old"]
 
     return {
         "df_history": df_history,
@@ -756,11 +966,15 @@ def display_upload_registry(user_role, upload_handler=None):
         st.success("Upload registry is healthy - every entry's files are present on disk.")
 
     df_report = pd.DataFrame(report)[
-        ["snapshot_date", "original_filename", "uploaded_by", "upload_timestamp",
+        ["upload_id", "snapshot_date", "original_filename", "uploaded_by", "upload_timestamp",
          "saved_sheets", "integrity_ok", "integrity_message"]
     ].sort_values("snapshot_date", ascending=False)
-    df_report.columns = ["Snapshot Date", "File Name", "Uploaded By", "Upload Time",
-                          "Sheets Saved", "Files OK", "Integrity Detail"]
+
+    display_report = df_report.rename(columns={
+        "snapshot_date": "Snapshot Date", "original_filename": "File Name",
+        "uploaded_by": "Uploaded By", "upload_timestamp": "Upload Time",
+        "saved_sheets": "Sheets Saved", "integrity_ok": "Files OK", "integrity_message": "Integrity Detail",
+    })
 
     def color_integrity(val):
         if val is True:
@@ -770,9 +984,55 @@ def display_upload_registry(user_role, upload_handler=None):
         return ""
 
     st.dataframe(
-        df_report.style.map(color_integrity, subset=["Files OK"]),
+        display_report.drop(columns=["upload_id"]).style.map(color_integrity, subset=["Files OK"]),
         use_container_width=True,
     )
+
+    # ---- Admin-only: view a snapshot's data, or delete it entirely ----
+    if can_upload(user_role):
+        st.markdown("---")
+        st.markdown("#### Manage a Snapshot")
+        st.caption("View the saved sheet data for any snapshot date, or permanently delete it.")
+
+        snapshot_labels = [
+            f"{row['Snapshot Date']} · {row['File Name']} (uploaded by {row['Uploaded By']})"
+            for _, row in display_report.iterrows()
+        ]
+        label_to_upload_id = dict(zip(snapshot_labels, display_report["upload_id"]))
+
+        if snapshot_labels:
+            selected_label = st.selectbox("Select a snapshot", snapshot_labels, key="registry_manage_select")
+            selected_upload_id = label_to_upload_id[selected_label]
+            entry = storage1.get_upload_by_id(selected_upload_id)
+
+            with st.expander("👁️ View Snapshot Data", expanded=False):
+                if entry and entry.get("saved_sheets"):
+                    sheet_pick = st.selectbox(
+                        "Sheet", entry["saved_sheets"], key=f"registry_view_sheet_{selected_upload_id}",
+                    )
+                    df_view = storage1.load_sheet_csv(selected_upload_id, sheet_pick)
+                    if df_view is not None:
+                        st.dataframe(df_view, use_container_width=True, height=400)
+                    else:
+                        st.warning("Could not load this sheet's saved data.")
+                else:
+                    st.info("No saved sheets found for this snapshot.")
+
+            mcol1, mcol2 = st.columns([3, 1])
+            with mcol2:
+                confirm_delete = st.checkbox("Confirm", key=f"confirm_delete_{selected_upload_id}")
+                if st.button("🗑️ Delete Snapshot", key=f"delete_upload_{selected_upload_id}",
+                             disabled=not confirm_delete, use_container_width=True, type="primary"):
+                    ok, msg = storage1.delete_upload(selected_upload_id)
+                    storage1.log_audit_event(
+                        st.session_state.get("user", {}).get("username", "unknown"),
+                        user_role, "snapshot_deleted", {"upload_id": selected_upload_id, "result": msg},
+                    )
+                    if ok:
+                        st.success(msg)
+                        st.rerun()
+                    else:
+                        st.error(msg)
 
 
 def display_summary_dashboard(sheet_name="Sheet1"):
@@ -1014,31 +1274,15 @@ def display_calendar_comparison(sheet_name="Sheet1"):
     st.caption(f"Baseline average working current: {baseline_current:.2f} A · Time-based metrics assume {WORKING_HOURS_START}:00-{WORKING_HOURS_END}:00 working hours per day.")
 
     st.markdown("---")
-    st.markdown("#### Top Movers (Change in Lost Current)")
-    movers = df_history[["Plot", "Block", inverter_col, "Change_Lost_Current",
-                          "Failed_to_Working", "Working_to_Failed"]].copy()
-    movers = movers.rename(columns={inverter_col: "Inverter"})
+    st.markdown("#### Restoration TAT Summary")
+    total_tat_hours = float(df_history["Restoration_TAT_Hours"].sum())
+    avg_tat_hours = float(df_history.loc[df_history["Restoration_TAT_Hours"] > 0, "Restoration_TAT_Hours"].mean()) if (df_history["Restoration_TAT_Hours"] > 0).any() else 0.0
+    still_failing_hours = float(df_history["Current_Failure_Hours"].sum())
 
-    top_improved = movers.sort_values("Change_Lost_Current").head(10)
-    top_degraded = movers.sort_values("Change_Lost_Current", ascending=False).head(10)
-
-    mv_col1, mv_col2 = st.columns(2)
-    with mv_col1:
-        fig_improved = px.bar(
-            top_improved.sort_values("Change_Lost_Current"), x="Change_Lost_Current", y="Inverter",
-            orientation="h", title="Top 10 Most Improved (Lost Current Reduced)",
-            color_discrete_sequence=["#10b981"],
-        )
-        fig_improved.update_layout(height=380, plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)")
-        st.plotly_chart(fig_improved, use_container_width=True, key="cal_top_improved")
-    with mv_col2:
-        fig_degraded = px.bar(
-            top_degraded.sort_values("Change_Lost_Current"), x="Change_Lost_Current", y="Inverter",
-            orientation="h", title="Top 10 Most Degraded (Lost Current Increased)",
-            color_discrete_sequence=["#ef4444"],
-        )
-        fig_degraded.update_layout(height=380, plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)")
-        st.plotly_chart(fig_degraded, use_container_width=True, key="cal_top_degraded")
+    t1, t2, t3 = st.columns(3)
+    t1.metric("Total Restoration TAT (hrs)", f"{total_tat_hours:,.0f}")
+    t2.metric("Avg TAT per Restored String (hrs)", f"{avg_tat_hours:,.1f}")
+    t3.metric("Cumulative Ongoing-Failure Hours", f"{still_failing_hours:,.0f}")
 
     st.markdown("---")
     st.markdown("#### Full Comparison Detail")
@@ -1105,6 +1349,7 @@ def display_tat_dashboard(processed_dataframes=None, current_df=None, sheet_name
         "Upload Registry",
         "Summary Dashboard",
         "String History Matrix",
+        "Inverter History Matrix",
         "Working Hours",
         "Calendar Compare",
     ])
@@ -1119,9 +1364,12 @@ def display_tat_dashboard(processed_dataframes=None, current_df=None, sheet_name
         display_string_history_matrix(history, current_df)
 
     with tabs[3]:
-        display_working_hours_analysis()
+        display_inverter_history_matrix()
 
     with tabs[4]:
+        display_working_hours_analysis()
+
+    with tabs[5]:
         display_calendar_comparison(sheet_name)
 
 
