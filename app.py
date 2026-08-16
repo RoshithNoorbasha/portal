@@ -176,6 +176,14 @@ st.markdown("""
 # ==========================================
 DEFAULT_TOTAL_ACTIVE_STRINGS = 19
 WORKING_CURRENT_THRESHOLD = 0.5
+# "Low performance" (yellow) = a working string sitting 20% or more below
+# its own inverter's average working current (previously 23%, 30%, and
+# 20% before that).
+LOW_PERFORMANCE_DROP_PCT = 0.20
+# A string only counts as a "negative value" fault (blinking red) at -1A or
+# below - values between -1A and 0.5A are still just "Failed" (red), not
+# flagged as a sensor/wiring-fault negative reading.
+NEGATIVE_VALUE_THRESHOLD = -1.0
 PV_CURRENT_COLUMNS = [f"PV-I{i}" for i in range(1, 29)]
 
 ACTIVE_STRING_OVERRIDES = {
@@ -187,6 +195,20 @@ INVERTER_ID_COLS = [
     "Inverter ID", "Inverter_ID", "Inverter", "ID",
     "Device Name", "String Inverter", "Inverters"
 ]
+
+# Duplicate Inverter IDs beyond this count in a single sheet block the
+# upload entirely (data quality issue too big to silently work around).
+# At or below this count, the upload still proceeds - duplicates are
+# de-duplicated (first occurrence kept) and reported as a warning so the
+# user can see exactly which Inverter IDs repeated.
+MAX_ALLOWED_DUPLICATE_INVERTERS = 6
+
+
+class InverterIDValidationError(Exception):
+    """Raised when a workbook's Inverter ID column is missing, contains
+    values that don't look like Inverter IDs, or has too many duplicate
+    Inverter IDs to safely auto-resolve."""
+    pass
 
 MANUAL_SCADA_COLUMNS = [
     "String Inverter", "MBUS", "Grid", "E-Daily(KWH)", "Active Power", "Reactive Power",
@@ -391,12 +413,93 @@ def get_column_header_color(value):
 # ==========================================
 # 5. OPTIMIZED PARSER WITH CACHING
 # ==========================================
+def _find_inverter_column(df):
+    """Locate the Inverter ID column by known header names (case-insensitive)."""
+    df_columns_lower_map = {str(c).strip().lower(): c for c in df.columns}
+    for col in INVERTER_ID_COLS:
+        if col in df.columns:
+            return col
+        elif col.strip().lower() in df_columns_lower_map:
+            return df_columns_lower_map[col.strip().lower()]
+    return None
+
+
+def _validate_inverter_id_values(df, col, sheet_name):
+    """
+    Guard against the case where a column matching a known Inverter ID
+    header name was found, but the *values* in it clearly aren't Inverter
+    IDs (e.g. the workbook's columns got shifted, or the wrong column was
+    labeled 'ID'). A real Inverter ID looks like 'P1-IB1-...' (Plot-Block-...),
+    so anything that mostly lacks that shape is treated as a wrong-column
+    upload and rejected with a clear exception instead of silently
+    producing a dashboard full of "Unknown Plot"/"Unknown Block" rows.
+    """
+    raw_values = df[col].dropna().astype(str).str.strip()
+    raw_values = raw_values[~raw_values.str.lower().isin(["", "nan", "none"])]
+
+    if raw_values.empty:
+        raise InverterIDValidationError(
+            f"Sheet '{sheet_name}': the detected Inverter ID column ('{col}') is empty. "
+            f"Please check that the correct column is labeled as the Inverter ID "
+            f"(expected one of: {', '.join(INVERTER_ID_COLS)}) and re-upload."
+        )
+
+    looks_like_id = raw_values.str.contains("-", regex=False)
+    invalid_ratio = 1 - looks_like_id.mean()
+
+    if invalid_ratio > 0.5:
+        sample_bad_values = raw_values[~looks_like_id].unique()[:5].tolist()
+        raise InverterIDValidationError(
+            f"Sheet '{sheet_name}': column '{col}' was matched as the Inverter ID column, "
+            f"but its values don't look like Inverter IDs (expected a format like 'P1-IB1-...'). "
+            f"Found values such as: {sample_bad_values}. Please check the column headers/values "
+            f"and re-upload."
+        )
+
+
+def _check_duplicate_inverter_ids(df, col, sheet_name):
+    """
+    Identify duplicate Inverter IDs in a sheet. Returns the sorted list of
+    duplicated IDs (empty if none). Raises InverterIDValidationError if the
+    number of distinct duplicated IDs exceeds MAX_ALLOWED_DUPLICATE_INVERTERS.
+    """
+    id_series = df[col].astype(str).str.strip()
+    id_series = id_series[~id_series.str.lower().isin(["", "nan", "none"])]
+
+    counts = id_series.value_counts()
+    duplicated_ids = sorted(counts[counts > 1].index.tolist())
+
+    if len(duplicated_ids) > MAX_ALLOWED_DUPLICATE_INVERTERS:
+        raise InverterIDValidationError(
+            f"Sheet '{sheet_name}': found {len(duplicated_ids)} duplicate Inverter ID(s), "
+            f"which exceeds the allowed limit of {MAX_ALLOWED_DUPLICATE_INVERTERS}. "
+            f"Duplicate Inverter IDs: {', '.join(duplicated_ids)}. "
+            f"Please fix the duplicates in the source file and re-upload."
+        )
+
+    return duplicated_ids
+
+
 @st.cache_data(show_spinner=False, ttl=3600)
 def process_scada_excel_bytes(file_bytes, filename_hash=None):
-    """Process SCADA file with caching based on file content"""
+    """
+    Process SCADA file with caching based on file content.
+
+    Returns a tuple: (processed_dfs, duplicate_warnings)
+      - processed_dfs: {sheet_name: DataFrame}, one row per UNIQUE Inverter ID
+        (duplicates de-duplicated, first occurrence kept).
+      - duplicate_warnings: {sheet_name: [duplicate_inverter_id, ...]} for any
+        sheet that had duplicates within the allowed limit (>MAX raises instead).
+
+    Raises InverterIDValidationError if a sheet's Inverter ID column can't be
+    found, its values don't look like Inverter IDs, or duplicates exceed the
+    allowed limit.
+    """
     file_stream = io.BytesIO(file_bytes)
     excel_file = pd.ExcelFile(file_stream, engine="openpyxl")
     processed_dfs = {}
+    duplicate_warnings = {}
+    sheet_skip_reasons = []
 
     for sheet_name in excel_file.sheet_names:
         try:
@@ -405,21 +508,32 @@ def process_scada_excel_bytes(file_bytes, filename_hash=None):
             continue
 
         df.dropna(how="all", inplace=True)
+        if df.empty:
+            continue
         df = df.loc[:, ~df.columns.astype(str).str.contains("^Unnamed:", case=False, regex=True)]
         df = df.loc[:, ~df.columns.duplicated()].copy()
 
-        df_columns_lower_map = {str(c).strip().lower(): c for c in df.columns}
-        actual_inverter_col = None
-        for col in INVERTER_ID_COLS:
-            if col in df.columns:
-                actual_inverter_col = col
-                break
-            elif col.strip().lower() in df_columns_lower_map:
-                actual_inverter_col = df_columns_lower_map[col.strip().lower()]
-                break
+        actual_inverter_col = _find_inverter_column(df)
 
         if not actual_inverter_col:
+            sheet_skip_reasons.append(
+                f"Sheet '{sheet_name}': no Inverter ID column found. "
+                f"Expected one of: {', '.join(INVERTER_ID_COLS)}. "
+                f"Found columns: {', '.join(str(c) for c in df.columns)}."
+            )
             continue
+
+        # Reject sheets where the matched column's *values* don't look like
+        # Inverter IDs (wrong column mapped to the expected header name).
+        _validate_inverter_id_values(df, actual_inverter_col, sheet_name)
+
+        # Detect duplicate Inverter IDs. Small numbers of duplicates are
+        # tolerated (de-duplicated + reported); too many blocks the upload.
+        duplicated_ids = _check_duplicate_inverter_ids(df, actual_inverter_col, sheet_name)
+        if duplicated_ids:
+            duplicate_warnings[sheet_name] = duplicated_ids
+            # Only ever calculate metrics against UNIQUE Inverter IDs.
+            df = df.drop_duplicates(subset=[actual_inverter_col], keep="first").reset_index(drop=True)
 
         df["Plot"] = df[actual_inverter_col].apply(extract_plot_cached)
         df["Block"] = df[actual_inverter_col].apply(extract_block_cached)
@@ -436,12 +550,12 @@ def process_scada_excel_bytes(file_bytes, filename_hash=None):
         df = df[final_columns]
         processed_dfs[sheet_name] = df
 
-    if processed_dfs:
-        first_sheet = next(iter(processed_dfs))
-        history_df = processed_dfs[first_sheet].copy()
-        restore.update_string_history(history_df, datetime.now().strftime("%Y-%m-%d"))
+    if not processed_dfs and sheet_skip_reasons:
+        raise InverterIDValidationError(
+            "Could not find a valid Inverter ID column in any sheet.\n" + "\n".join(sheet_skip_reasons)
+        )
 
-    return processed_dfs
+    return processed_dfs, duplicate_warnings
 
 
 def process_scada_excel_with_status(file_bytes, filename_hash=None, source_label="SCADA workbook"):
@@ -453,6 +567,7 @@ def process_scada_excel_with_status(file_bytes, filename_hash=None, source_label
         ("💾", "Saving snapshot", "Persisting the processed snapshot for dashboards & history..."),
     ]
 
+    duplicate_warnings = {}
     with st.status(f"Processing **{source_label}**", expanded=True) as status:
         progress = st.progress(0, text=f"{steps[0][0]}  {steps[0][1]}...")
         status.write(f"{steps[0][0]} **{steps[0][1]}** — {steps[0][2]}")
@@ -461,7 +576,13 @@ def process_scada_excel_with_status(file_bytes, filename_hash=None, source_label
         progress.progress(55, text=f"{steps[2][0]}  {steps[2][1]}...")
         status.write(f"{steps[2][0]} **{steps[2][1]}** — {steps[2][2]}")
 
-        processed_dfs = process_scada_excel_bytes(file_bytes, filename_hash=filename_hash)
+        try:
+            processed_dfs, duplicate_warnings = process_scada_excel_bytes(file_bytes, filename_hash=filename_hash)
+        except InverterIDValidationError as exc:
+            progress.progress(100, text="Failed")
+            status.update(label=f"❌ Could not process {source_label}", state="error", expanded=True)
+            status.write(f"⚠️ {exc}")
+            return {}
 
         progress.progress(85, text=f"{steps[3][0]}  {steps[3][1]}...")
         status.write(f"{steps[3][0]} **{steps[3][1]}** — {steps[3][2]}")
@@ -474,9 +595,21 @@ def process_scada_excel_with_status(file_bytes, filename_hash=None, source_label
                 label=f"✅ {source_label} processed — {sheet_count} sheet(s), {row_count:,} row(s)",
                 state="complete", expanded=False,
             )
+            for sheet_name, dup_ids in duplicate_warnings.items():
+                status.write(
+                    f"⚠️ Sheet '{sheet_name}': {len(dup_ids)} duplicate Inverter ID(s) found and "
+                    f"de-duplicated (first occurrence kept): {', '.join(dup_ids)}"
+                )
         else:
             progress.progress(100, text="Failed")
             status.update(label=f"❌ Could not process {source_label}", state="error", expanded=True)
+
+    if duplicate_warnings:
+        for sheet_name, dup_ids in duplicate_warnings.items():
+            st.warning(
+                f"⚠️ Sheet '{sheet_name}': {len(dup_ids)} duplicate Inverter ID(s) found "
+                f"(de-duplicated, first occurrence kept): {', '.join(dup_ids)}"
+            )
 
     return processed_dfs
 
@@ -534,23 +667,73 @@ ROLE_BADGES = {
 }
 
 def process_and_save_upload(file_bytes, filename, snapshot_date, username, role):
-    processed = process_scada_excel_bytes(file_bytes)
+    snapshot_date_str = str(snapshot_date)
+
+    try:
+        processed, duplicate_warnings = process_scada_excel_bytes(file_bytes)
+    except InverterIDValidationError as exc:
+        return False, f"Upload rejected — {exc}"
+
     if not processed:
         return False, "Could not process this workbook - no valid sheets/inverter column found."
 
     upload_id, msg = storage1.save_preprocessed_upload(
         file_bytes=file_bytes, original_filename=filename,
-        processed_dataframes=processed, snapshot_date=str(snapshot_date),
+        processed_dataframes=processed, snapshot_date=snapshot_date_str,
         uploaded_by=username,
     )
 
     if upload_id is None:
         return False, msg
 
+    first_sheet = next(iter(processed))
+    restore.update_string_history(processed[first_sheet].copy(), snapshot_date_str)
+    restore.clear_snapshot_caches()
+
     if not msg.lower().startswith("file already exists"):
-        storage1.log_audit_event(username, role, "file_uploaded",
-                                 {"filename": filename, "snapshot_date": str(snapshot_date), "upload_id": upload_id})
+        audit_details = {"filename": filename, "snapshot_date": snapshot_date_str, "upload_id": upload_id}
+        if duplicate_warnings:
+            # Persist which Inverter IDs were duplicated so it can be shown
+            # later on the Dashboard, not just in the upload status card.
+            audit_details["duplicate_inverter_ids"] = duplicate_warnings
+        storage1.log_audit_event(username, role, "file_uploaded", audit_details)
+
+    if duplicate_warnings:
+        dup_notes = []
+        for sheet_name, dup_ids in duplicate_warnings.items():
+            dup_notes.append(f"Sheet '{sheet_name}': {len(dup_ids)} duplicate Inverter ID(s) — {', '.join(dup_ids)}")
+        msg = msg + "\n\n⚠️ Duplicate Inverter IDs were found and de-duplicated (first occurrence kept):\n" + "\n".join(dup_notes)
+
     return True, msg
+
+def get_duplicate_inverter_warnings_for_snapshot(snapshot_date):
+    """
+    Look up the audit log for the 'file_uploaded' event that produced this
+    snapshot date and return any recorded duplicate Inverter IDs
+    ({sheet_name: [duplicate_id, ...]}). Returns {} if none were recorded.
+    This is how duplicate-inverter details persist on the Dashboard after
+    the upload itself has finished, instead of only flashing during upload.
+    """
+    if not snapshot_date:
+        return {}
+    snapshot_date_str = str(snapshot_date)
+    try:
+        entries = storage1.get_audit_log()
+    except Exception:
+        return {}
+
+    matches = [
+        e for e in entries
+        if e.get("event_type") == "file_uploaded"
+        and str((e.get("details") or {}).get("snapshot_date")) == snapshot_date_str
+        and (e.get("details") or {}).get("duplicate_inverter_ids")
+    ]
+    if not matches:
+        return {}
+
+    matches.sort(key=lambda e: e.get("timestamp", ""), reverse=True)
+    return matches[0]["details"]["duplicate_inverter_ids"]
+
 
 def create_excel_download(dataframes_dict):
     buffer = io.BytesIO()
@@ -979,6 +1162,13 @@ def audit_log_tab():
     df_audit = pd.DataFrame(entries)[["timestamp", "username", "role", "event_type", "details", "entry_hash"]]
     df_audit = df_audit.sort_values("timestamp", ascending=False)
 
+    # Details come back as raw dicts (e.g. {"duplicate_inverter_ids": {...}}),
+    # which Streamlit's Arrow-backed st.dataframe can't render directly and
+    # was silently breaking this tab. Flatten to a readable JSON string.
+    df_audit["details"] = df_audit["details"].apply(
+        lambda d: json.dumps(d, default=str, ensure_ascii=False) if isinstance(d, dict) else ("" if d is None else str(d))
+    )
+
     scope_label = "All Users" if role == "admin" else "Engineers" if role == "manager" else "My Activity"
 
     filter_col1, filter_col2, metric_col = st.columns([1, 1, 1])
@@ -1054,7 +1244,25 @@ def get_inverter_column_cached(df):
     return None
 
 # Cache filter options with hash
-@st.cache_data(ttl=3600, hash_funcs={pd.DataFrame: lambda df: df.shape[0]})
+def _fast_df_fingerprint(df):
+    """
+    Fast content fingerprint used as a Streamlit cache key for DataFrame
+    arguments. Hashing only df.shape[0] (row count) is unsafe: two different
+    filter selections (or a freshly re-uploaded snapshot) that happen to
+    produce the same row count would silently reuse another selection's
+    stale cached result - a real source of wrong numbers elsewhere in this
+    tab. pd.util.hash_pandas_object is vectorized and still far cheaper than
+    Streamlit's default full-object hash, but actually reflects the data.
+    """
+    if df is None or df.empty:
+        return 0
+    try:
+        return int(pd.util.hash_pandas_object(df, index=True).sum())
+    except Exception:
+        return (df.shape, tuple(df.columns))
+
+
+@st.cache_data(ttl=3600, hash_funcs={pd.DataFrame: _fast_df_fingerprint})
 def get_filter_options_cached(df, column):
     """Cache filter options for a specific column with dataframe hash"""
     if column in df.columns:
@@ -1065,7 +1273,7 @@ def get_filter_options_cached(df, column):
 # The previous per-row `.iterrows()` loop was the main reason the PV String
 # Details tab felt slow: every filter change re-ran that loop over the whole
 # (filtered) sheet. Vectorized pandas ops give the same output far faster.
-@st.cache_data(ttl=300, hash_funcs={pd.DataFrame: lambda df: df.shape[0]})
+@st.cache_data(ttl=300, hash_funcs={pd.DataFrame: _fast_df_fingerprint})
 def calculate_summary_metrics_cached(filtered_df, inverter_col, pv_voltage_cols, pv_current_cols):
     """Vectorized summary metrics calculation."""
     if filtered_df.empty:
@@ -1135,7 +1343,7 @@ def calculate_summary_metrics_cached(filtered_df, inverter_col, pv_voltage_cols,
     return summary_df
 
 # Cache the filtered dataframe with hash
-@st.cache_data(ttl=60, hash_funcs={pd.DataFrame: lambda df: df.shape[0]})
+@st.cache_data(ttl=60, hash_funcs={pd.DataFrame: _fast_df_fingerprint})
 def apply_filters_cached(df, selected_plot, selected_block, selected_sacu, selected_inverter,
                          selected_grid, selected_status, inverter_col):
     """Cache the filtered dataframe result"""
@@ -1189,66 +1397,44 @@ def color_failed_strings(val):
         else: return 'background-color: #ef4444; color: white; font-weight: bold'
     return ''
 
-@st.cache_data(ttl=300, hash_funcs={pd.DataFrame: lambda df: df.shape[0]})
+@st.cache_data(ttl=300, hash_funcs={pd.DataFrame: _fast_df_fingerprint})
 def find_low_performance_strings_cached(filtered_df, inverter_col, pv_current_cols):
     """
-    Return PV string rows whose current is more than 20% below the average
-    of the same inverter's working strings, matching the Colab implementation.
+    Return PV string rows whose current is >= LOW_PERFORMANCE_DROP_PCT (30%)
+    below the average of the same inverter's own working strings - matches
+    the Individual String Details tab's classification exactly. Vectorized
+    (no per-row Python loop) so it stays fast on large sheets.
     """
     present_cols = [c for c in pv_current_cols if c in filtered_df.columns]
     if filtered_df is None or filtered_df.empty or not present_cols or inverter_col not in filtered_df.columns:
         return pd.DataFrame()
 
-    low_performance_pv_strings = []
+    numeric = filtered_df[present_cols].apply(pd.to_numeric, errors="coerce")
+    working_mask = numeric > WORKING_CURRENT_THRESHOLD
+    average_current = numeric.where(working_mask).mean(axis=1)
+    low_performance_threshold = average_current * (1 - LOW_PERFORMANCE_DROP_PCT)
 
-    for _, row in filtered_df.iterrows():
-        plot = row["Plot"] if "Plot" in row else None
-        block = row["Block"] if "Block" in row else None
-        sacu = row["SACU"] if "SACU" in row else None
-        inverter_name = row[inverter_col]
-
-        pv_current_values = []
-        for pv_col in present_cols:
-            value = pd.to_numeric(row[pv_col], errors="coerce")
-            if pd.notna(value):
-                pv_current_values.append(value)
-
-        working_pv_currents = [val for val in pv_current_values if val > WORKING_CURRENT_THRESHOLD]
-        average_current = sum(working_pv_currents) / len(working_pv_currents) if working_pv_currents else 0
-        low_performance_threshold = average_current * 0.80
-
-        for pv_col in present_cols:
-            pv_value = pd.to_numeric(row[pv_col], errors="coerce")
-            if pd.isna(pv_value):
-                continue
-
-            if pv_value < 0:
-                status = "Blinking Red - Negative Value"
-            elif pv_value <= WORKING_CURRENT_THRESHOLD:
-                status = "Red - Failed"
-            elif average_current > 0 and pv_value > WORKING_CURRENT_THRESHOLD and pv_value < low_performance_threshold:
-                status = "Yellow - Low Performance"
-            elif pv_value > WORKING_CURRENT_THRESHOLD:
-                status = "Green - Working"
-            else:
-                status = "Unknown"
-
-            if status == "Yellow - Low Performance":
-                low_performance_pv_strings.append({
-                    "Plot": plot,
-                    "Block": block,
-                    "SACU": sacu,
-                    "Inverter Name": inverter_name,
-                    "MPPT PV No": pv_col,
-                    "PV Value": round(pv_value, 2),
-                    "Inverter Avg Current (Working Strings)": round(average_current, 2),
-                    "Low Performance Threshold (20% below avg)": round(low_performance_threshold, 2),
-                })
-
-    if not low_performance_pv_strings:
+    low_mask = working_mask & numeric.lt(low_performance_threshold, axis=0) & (average_current > 0)
+    if not low_mask.to_numpy().any():
         return pd.DataFrame()
 
-    return pd.DataFrame(low_performance_pv_strings)
+    context_cols = [c for c in [inverter_col, "Plot", "Block", "SACU", "Grid"] if c in filtered_df.columns]
+    context = filtered_df[context_cols].copy()
+    context["Inverter Avg Current (Working Strings)"] = average_current.round(2)
+    context[f"Low Performance Threshold ({LOW_PERFORMANCE_DROP_PCT*100:.0f}% below avg)"] = low_performance_threshold.round(2)
+
+    values_only = numeric.where(low_mask)
+    melted = values_only.join(context).reset_index(drop=True).melt(
+        id_vars=context_cols + ["Inverter Avg Current (Working Strings)",
+                                 f"Low Performance Threshold ({LOW_PERFORMANCE_DROP_PCT*100:.0f}% below avg)"],
+        value_vars=present_cols, var_name="MPPT PV No", value_name="PV Value",
+    )
+    melted = melted.dropna(subset=["PV Value"]).reset_index(drop=True)
+    melted["PV Value"] = melted["PV Value"].round(2)
+    if inverter_col in melted.columns and inverter_col != "Inverter Name":
+        melted = melted.rename(columns={inverter_col: "Inverter Name"})
+    return melted
+
 
 
 def create_pv_string_tab(df):
@@ -1433,13 +1619,24 @@ def create_pv_string_tab(df):
         total_strings_all = summary_df["Total Strings"].sum()
         total_failed = summary_df["Failed Strings"].sum()
         overall_availability = (total_working / total_strings_all * 100) if total_strings_all > 0 else 0
+        avail_color = "#10b981" if overall_availability >= 90 else "#34d399" if overall_availability >= 70 else "#fbbf24" if overall_availability >= 50 else "#ef4444"
 
-        col1, col2, col3, col4, col5 = st.columns(5)
-        col1.metric("Total Inverters", total_inverters)
-        col2.metric("Total Strings", total_strings_all)
-        col3.metric("Working Strings", total_working)
-        col4.metric("Failed Strings", total_failed)
-        col5.metric("Overall Availability", f"{overall_availability:.1f}%")
+        render_kpi_cards([
+            {"label": "TOTAL INVERTERS", "value": f"{total_inverters:,}", "icon": "fas fa-microchip", "color": "#818cf8", "sub": "Unique Inverter IDs"},
+            {"label": "TOTAL STRINGS", "value": f"{int(total_strings_all):,}", "icon": "fas fa-plug", "color": "#a78bfa"},
+            {"label": "WORKING STRINGS", "value": f"{int(total_working):,}", "icon": "fas fa-circle-check", "color": "#10b981"},
+            {"label": "FAILED STRINGS", "value": f"{int(total_failed):,}", "icon": "fas fa-circle-xmark", "color": "#ef4444"},
+            {"label": "AVAILABILITY", "value": f"{overall_availability:.1f}%", "icon": "fas fa-gauge-high", "color": avail_color},
+        ])
+
+        # BLOCK-WISE KPI CARDS - scoped to whatever Plot/Block/SACU/Inverter
+        # filters are currently selected above, so picking a Plot narrows
+        # these cards down to that plot's blocks automatically.
+        st.markdown("---")
+        block_summary = calculate_block_summary_cached(filtered_df, inverter_col)
+        if not block_summary.empty:
+            plot_context = selected_plot if selected_plot != "All" else "All Plots"
+            display_block_metrics(block_summary, plot_context)
 
         # INVERTER-WISE SUMMARY TABLE
         st.markdown("---")
@@ -1620,7 +1817,9 @@ def create_pv_string_tab(df):
                 # ==========================================
                 st.markdown('<h4><i class="fas fa-list-check"></i> PV String Status</h4>', unsafe_allow_html=True)
                 st.caption(
-                    "Green = Working (>0.5A) | Yellow = Low Performance (8-10A below average) | Red = Failed (<=0.5A) | Blinking Red = Negative Values")
+                    f"Green = Working (>{WORKING_CURRENT_THRESHOLD}A) | Yellow = Low Performance "
+                    f"({LOW_PERFORMANCE_DROP_PCT*100:.0f}% below average) | Red = Failed (<={WORKING_CURRENT_THRESHOLD}A) | "
+                    f"Blinking Red = Negative Values (<= {NEGATIVE_VALUE_THRESHOLD}A)")
 
                 # Sort PV current columns by number with proper parsing
                 def get_pv_number(col):
@@ -1656,7 +1855,7 @@ def create_pv_string_tab(df):
                         value = inverter_data[col]
                         if pd.notna(value):
                             status = "Working" if value > WORKING_CURRENT_THRESHOLD else "Failed"
-                            is_negative = value < 0
+                            is_negative = value <= NEGATIVE_VALUE_THRESHOLD
                             all_string_data[col] = {
                                 "value": value,
                                 "status": status,
@@ -1667,7 +1866,7 @@ def create_pv_string_tab(df):
                                 working_values.append(value)
 
                 avg_working = sum(working_values) / len(working_values) if working_values else 0
-                low_performance_threshold = avg_working * 0.8 if avg_working > 0 else 0
+                low_performance_threshold = avg_working * (1 - LOW_PERFORMANCE_DROP_PCT) if avg_working > 0 else 0
 
                 string_data = {}
                 for col, data in all_string_data.items():
@@ -1774,7 +1973,7 @@ def create_pv_string_tab(df):
 
                     if working_values:
                         st.info(
-                            f"Average Working Current: **{avg_working:.2f}A** | Low Performance Threshold: **{low_performance_threshold:.2f}A** (20% below average)")
+                            f"Average Working Current: **{avg_working:.2f}A** | Low Performance Threshold: **{low_performance_threshold:.2f}A** ({LOW_PERFORMANCE_DROP_PCT*100:.0f}% below average)")
 
                     st.markdown('<h4><i class="fas fa-list"></i> Performance Summary</h4>', unsafe_allow_html=True)
 
@@ -1816,7 +2015,7 @@ def create_pv_string_tab(df):
                         with alert_cols[0]:
                             if low_performance > 0:
                                 st.warning(
-                                    f"**{low_performance}** string(s) are performing below the threshold (20% below average)")
+                                    f"**{low_performance}** string(s) are performing below the threshold ({LOW_PERFORMANCE_DROP_PCT*100:.0f}% below average)")
                                 low_strings = [f"PV-{data['pv_num']} ({data['value']:.1f}A)" for col, data in
                                                string_data.items() if data["performance"] == "low"]
                                 if low_strings:
@@ -1869,7 +2068,8 @@ def create_pv_string_tab(df):
             failed_inverter_ids = failed_summary_df["Inverter ID"].tolist()
             failed_detail_df = filtered_df[filtered_df[inverter_col].isin(failed_inverter_ids)].copy()
 
-            detail_display_cols = [inverter_col, "Plot", "Block", "SACU"]
+            detail_display_cols = [inverter_col, "Plot", "Block", "SACU", "Grid"]
+            detail_display_cols = [c for c in detail_display_cols if c == inverter_col or c in failed_detail_df.columns]
             for col in ["Total Active Strings", "Working String Count", "Failed String Count",
                         "Availability (%)", "Failure Percentage (%)"]:
                 if col in failed_detail_df.columns:
@@ -1932,14 +2132,14 @@ def create_pv_string_tab(df):
     with tab4:
         st.markdown('<h3><i class="fas fa-triangle-exclamation" style="color:#fbbf24;"></i> Low Performance Strings</h3>', unsafe_allow_html=True)
         st.caption(
-            "Strings that are working but sitting more than 20% below their own inverter's average "
+            f"Strings that are working but sitting more than {LOW_PERFORMANCE_DROP_PCT*100:.0f}% below their own inverter's average "
             "working current are flagged yellow, scoped to the filters above."
         )
 
         low_perf_df = find_low_performance_strings_cached(filtered_df, inverter_col, pv_current_cols)
 
         if low_perf_df.empty:
-            st.info("No low performance PV strings found based on the defined 20% below average threshold.")
+            st.info(f"No low performance PV strings found based on the defined {LOW_PERFORMANCE_DROP_PCT*100:.0f}% below average threshold.")
         else:
             lp_col1, lp_col2, lp_col3 = st.columns(3)
             lp_col1.metric("Low Performance Strings", len(low_perf_df))
@@ -1949,7 +2149,8 @@ def create_pv_string_tab(df):
             def color_low_perf(val):
                 return 'background-color: #fbbf24; color: black; font-weight: bold;'
 
-            styled_low_perf = low_perf_df.style.map(color_low_perf, subset=["PV Value", "Low Performance Threshold (20% below avg)"])
+            threshold_col = f"Low Performance Threshold ({LOW_PERFORMANCE_DROP_PCT*100:.0f}% below avg)"
+            styled_low_perf = low_perf_df.style.map(color_low_perf, subset=["PV Value", threshold_col])
             st.dataframe(styled_low_perf, use_container_width=True, height=420)
 
             dl_col1, dl_col2 = st.columns(2)
@@ -2012,6 +2213,109 @@ def calculate_plot_summary_cached(df, inverter_col):
     block_count = df.groupby("Plot")["Block"].nunique().reset_index(name="Total_Blocks")
     plot_summary = plot_summary.merge(block_count, on="Plot", how="left")
     return plot_summary
+
+@st.cache_data(ttl=300)
+def calculate_block_summary_cached(df, inverter_col):
+    """
+    Cache block-wise summary calculations (grouped by Plot + Block).
+    Inverter counts use nunique() on the Inverter ID column so duplicate
+    rows for the same physical inverter are only ever counted once.
+    """
+    if df is None or df.empty or "Block" not in df.columns:
+        return pd.DataFrame()
+
+    group_cols = ["Plot", "Block"] if "Plot" in df.columns else ["Block"]
+
+    if inverter_col and inverter_col in df.columns:
+        inverter_counts = df.groupby(group_cols)[inverter_col].nunique().reset_index(name="Total_Inverters")
+    else:
+        inverter_counts = df.groupby(group_cols).size().reset_index(name="Total_Inverters")
+
+    block_summary = df.groupby(group_cols, as_index=False).agg(
+        Total_Active_Strings=("Total Active Strings", "sum"),
+        Total_Working_Strings=("Working String Count", "sum"),
+        Total_Failed_Strings=("Failed String Count", "sum"),
+    )
+    block_summary = block_summary.merge(inverter_counts, on=group_cols, how="left")
+    block_summary["Total_Inverters"] = block_summary["Total_Inverters"].fillna(0).astype(int)
+    block_summary["Availability (%)"] = ((block_summary["Total_Working_Strings"] / block_summary["Total_Active_Strings"]) * 100).fillna(0).round(2)
+    block_summary["Failure Percentage (%)"] = ((block_summary["Total_Failed_Strings"] / block_summary["Total_Active_Strings"]) * 100).fillna(0).round(2)
+    block_summary["Health Status"] = block_summary["Availability (%)"].apply(
+        lambda x: "Excellent" if x >= 90 else "Good" if x >= 70 else "Fair" if x >= 50 else "Poor"
+    )
+    if "Plot" in block_summary.columns:
+        block_summary["Block Label"] = block_summary["Plot"].astype(str) + " · " + block_summary["Block"].astype(str)
+    else:
+        block_summary["Block Label"] = block_summary["Block"].astype(str)
+
+    block_summary = block_summary.sort_values("Block Label").reset_index(drop=True)
+    return block_summary
+
+
+def display_block_metrics(block_summary, plot_context="All Plots"):
+    """Render Block-wise Performance Overview KPI cards (purple/indigo theme,
+    to visually pair with - but stay distinct from - the Plot-wise cards)."""
+    st.markdown(
+        f'<i class="fas fa-layer-group"></i> Block-wise Performance Overview '
+        f'<span style="color:#94a3b8; font-size:0.85rem; font-weight:400;">— {plot_context}</span>',
+        unsafe_allow_html=True,
+    )
+
+    records = block_summary.to_dict("records")
+    cards_per_row = 4
+    for row_start in range(0, len(records), cards_per_row):
+        row_records = records[row_start:row_start + cards_per_row]
+        cols = st.columns(len(row_records))
+        for col, row in zip(cols, row_records):
+            avail = row["Availability (%)"]
+            if avail >= 90:
+                status_color, status_icon, status_text = "#10b981", '<i class="fas fa-circle-check"></i>', "Excellent"
+            elif avail >= 70:
+                status_color, status_icon, status_text = "#34d399", '<i class="fas fa-circle-check"></i>', "Good"
+            elif avail >= 50:
+                status_color, status_icon, status_text = "#fbbf24", '<i class="fas fa-circle-exclamation"></i>', "Fair"
+            else:
+                status_color, status_icon, status_text = "#ef4444", '<i class="fas fa-circle-xmark"></i>', "Poor"
+
+            with col:
+                st.markdown(f"""
+                <div style='background: linear-gradient(135deg, #1e1b4b 0%, #0f172a 100%); border: 2px solid {status_color}; border-radius: 12px; padding: 14px; margin: 5px 0;'>
+                    <div style='display: flex; justify-content: space-between; align-items: center;'>
+                        <h4 style='margin: 0; color: #f1f5f9; font-size: 14px;'><i class="fas fa-layer-group" style="color:#a78bfa; margin-right:6px;"></i>{row['Block Label']}</h4>
+                        <span style='font-size: 18px; color: {status_color};'>{status_icon}</span>
+                    </div>
+                    <div style='margin-top: 8px;'>
+                        <div style='display: flex; justify-content: space-between;'>
+                            <span style='color: #94a3b8; font-size: 11px;'>Status</span>
+                            <span style='color: {status_color}; font-weight: bold; font-size: 13px;'>{status_text}</span>
+                        </div>
+                        <div style='display: flex; justify-content: space-between; margin-top: 4px;'>
+                            <span style='color: #94a3b8; font-size: 11px;'>Inverters (unique)</span>
+                            <span style='color: #f1f5f9; font-weight: bold;'>{int(row['Total_Inverters']):,}</span>
+                        </div>
+                        <div style='display: flex; justify-content: space-between;'>
+                            <span style='color: #94a3b8; font-size: 11px;'>Total Strings</span>
+                            <span style='color: #f1f5f9; font-weight: bold;'>{int(row['Total_Active_Strings']):,}</span>
+                        </div>
+                        <div style='display: flex; justify-content: space-between;'>
+                            <span style='color: #94a3b8; font-size: 11px;'><i class="fas fa-circle-check" style="color:#10b981;"></i> Working</span>
+                            <span style='color: #10b981; font-weight: bold;'>{int(row['Total_Working_Strings']):,}</span>
+                        </div>
+                        <div style='display: flex; justify-content: space-between; margin-bottom: 8px;'>
+                            <span style='color: #94a3b8; font-size: 11px;'><i class="fas fa-circle-xmark" style="color:#ef4444;"></i> Failed</span>
+                            <span style='color: #ef4444; font-weight: bold;'>{int(row['Total_Failed_Strings']):,}</span>
+                        </div>
+                        <div style='background-color: #1e293b; height: 7px; border-radius: 4px; overflow: hidden;'>
+                            <div style='background: linear-gradient(90deg, {status_color}, {status_color}88); width: {avail}%; height: 100%;'></div>
+                        </div>
+                        <div style='display: flex; justify-content: space-between; margin-top: 4px;'>
+                            <span style='color: #94a3b8; font-size: 10px;'>Availability</span>
+                            <span style='color: {status_color}; font-weight: bold; font-size: 14px;'>{avail:.1f}%</span>
+                        </div>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+
 
 @st.cache_data(ttl=300)
 def create_plot_charts_cached(plot_summary):
@@ -2114,9 +2418,68 @@ def display_plot_metrics(plot_summary):
             </div>
             """, unsafe_allow_html=True)
 
-def main_dashboard_tab(df, sheet_df=None, sheet_name="Sheet1"):
+def render_kpi_cards(metrics):
+    """Render a row of attractive gradient KPI cards. `metrics` is a list of
+    dicts: {label, value, icon (Font Awesome class), color (hex), sub (optional)}."""
+    cols = st.columns(len(metrics))
+    for col, m in zip(cols, metrics):
+        color = m["color"]
+        sub_html = (
+            f"<div style='color:#64748b; font-size:11px; margin-top:2px;'>{m['sub']}</div>"
+            if m.get("sub") else ""
+        )
+        with col:
+            st.markdown(f"""
+            <div style='background: linear-gradient(150deg, #0f172a 0%, #111827 100%);
+                        border: 1px solid {color}55; border-left: 4px solid {color};
+                        border-radius: 12px; padding: 14px 16px; margin: 4px 0;
+                        box-shadow: 0 8px 20px rgba(2,6,23,0.25);'>
+                <div style='display:flex; align-items:center; justify-content:space-between;'>
+                    <span style='color:#94a3b8; font-size:12px; font-weight:600; letter-spacing:.02em;'>{m['label']}</span>
+                    <span style='width:30px; height:30px; border-radius:9px; background:{color}22;
+                                 display:flex; align-items:center; justify-content:center; color:{color}; font-size:14px;'>
+                        <i class="{m['icon']}"></i>
+                    </span>
+                </div>
+                <div style='color:#f8fafc; font-size:1.55rem; font-weight:800; margin-top:6px; line-height:1;'>{m['value']}</div>
+                {sub_html}
+            </div>
+            """, unsafe_allow_html=True)
+
+
+def main_dashboard_tab(df, sheet_df=None, sheet_name="Sheet1", snapshot_date=None):
     st.markdown('<h1><i class="fas fa-sun" style="color:#fbbf24;"></i> Solar PV String Performance Dashboard</h1>', unsafe_allow_html=True)
     st.caption("Internal beta release - data processing, history, and comparison features are under testing.")
+
+    # ---- Persistent duplicate-Inverter-ID banner ----
+    # Surfaces here (not just as a one-time upload toast) so it stays
+    # visible for anyone viewing this snapshot's dashboard later.
+    duplicate_warnings = get_duplicate_inverter_warnings_for_snapshot(snapshot_date)
+    if duplicate_warnings:
+        dup_lines = []
+        total_dup_count = 0
+        for sh_name, dup_ids in duplicate_warnings.items():
+            total_dup_count += len(dup_ids)
+            dup_lines.append(
+                f"<div style='margin-top:4px;'><b>{sh_name}:</b> "
+                f"<span style='color:#fecaca;'>{', '.join(dup_ids)}</span></div>"
+            )
+        st.markdown(f"""
+        <div style='background: linear-gradient(120deg, rgba(127,29,29,0.35) 0%, rgba(15,23,42,0.9) 100%);
+                    border: 1px solid rgba(248,113,113,0.4); border-left: 4px solid #ef4444;
+                    border-radius: 12px; padding: 12px 16px; margin-bottom: 14px;'>
+            <div style='display:flex; align-items:center; gap:8px;'>
+                <i class="fas fa-triangle-exclamation" style="color:#f87171; font-size:16px;"></i>
+                <span style='color:#fecaca; font-weight:700; font-size:0.95rem;'>
+                    Duplicate Inverter IDs detected in this snapshot ({total_dup_count} total)
+                </span>
+            </div>
+            <div style='color:#e2e8f0; font-size:0.82rem; margin-top:6px;'>
+                These were de-duplicated (first occurrence kept) when calculating the metrics below.
+                {''.join(dup_lines)}
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
 
     inverter_col = get_inverter_column_cached(df)
 
@@ -2124,26 +2487,24 @@ def main_dashboard_tab(df, sheet_df=None, sheet_name="Sheet1"):
 
     st.markdown("### <i class='fas fa-chart-line'></i> Key Performance Indicators", unsafe_allow_html=True)
 
-    total_inverters = int(len(df))
+    # Inverter count reflects UNIQUE Inverter IDs only, consistent with the
+    # de-duplication applied at upload time.
+    total_inverters = int(df[inverter_col].nunique()) if inverter_col and inverter_col in df.columns else int(len(df))
     total_strings = int(df["Total Active Strings"].sum()) if "Total Active Strings" in df.columns else 0
     working_strings = int(df["Working String Count"].sum()) if "Working String Count" in df.columns else 0
     failed_strings = int(df["Failed String Count"].sum()) if "Failed String Count" in df.columns else 0
     overall_availability = round((working_strings / total_strings) * 100, 2) if total_strings > 0 else 0.0
     num_plots = plot_summary["Plot"].nunique() if not plot_summary.empty else 0
+    avail_color = "#10b981" if overall_availability >= 90 else "#34d399" if overall_availability >= 70 else "#fbbf24" if overall_availability >= 50 else "#ef4444"
 
-    col1, col2, col3 = st.columns(3)
-
-    with col1:
-        st.metric("Total Plots", f"{num_plots:,}")
-        st.metric("Working", f"{working_strings:,}")
-
-    with col2:
-        st.metric("Total Inverters", f"{total_inverters:,}")
-        st.metric("Failed", f"{failed_strings:,}")
-
-    with col3:
-        st.metric("Total Strings", f"{total_strings:,}")
-        st.metric("Availability", f"{overall_availability:.1f}%")
+    render_kpi_cards([
+        {"label": "TOTAL PLOTS", "value": f"{num_plots:,}", "icon": "fas fa-map-location-dot", "color": "#38bdf8"},
+        {"label": "TOTAL INVERTERS", "value": f"{total_inverters:,}", "icon": "fas fa-microchip", "color": "#818cf8", "sub": "Unique Inverter IDs"},
+        {"label": "TOTAL STRINGS", "value": f"{total_strings:,}", "icon": "fas fa-plug", "color": "#a78bfa"},
+        {"label": "WORKING", "value": f"{working_strings:,}", "icon": "fas fa-circle-check", "color": "#10b981"},
+        {"label": "FAILED", "value": f"{failed_strings:,}", "icon": "fas fa-circle-xmark", "color": "#ef4444"},
+        {"label": "AVAILABILITY", "value": f"{overall_availability:.1f}%", "icon": "fas fa-gauge-high", "color": avail_color},
+    ])
 
     st.markdown("---")
     if not plot_summary.empty:
@@ -2515,14 +2876,16 @@ def main():
             # getting reprocessed (and re-logged to the audit log) on every
             # single rerun - looping "file_uploaded" events. Only process a
             # given file once per browser session unless it actually changes.
-            already_processed = st.session_state.get("last_processed_upload_hash") == file_hash
+            upload_signature = f"{snapshot_date}:{file_hash}"
+            already_processed = st.session_state.get("last_processed_upload_signature") == upload_signature
             if not already_processed:
                 ok, msg = process_and_save_upload(
                     file_bytes, uploaded_file.name, snapshot_date,
                     current_user["username"], role,
                 )
-                st.session_state.last_processed_upload_hash = file_hash
                 if ok:
+                    st.session_state.last_processed_upload_signature = upload_signature
+                    st.session_state.header_snapshot_date = str(snapshot_date)
                     st.sidebar.success(msg)
                     st.rerun()
                 else:
@@ -2630,12 +2993,21 @@ def main():
     inverter_col = get_inverter_column_cached(filtered_df)
 
     tab1, tab2, tab3, tab4, tab5 = st.tabs(
-        ["Dashboard", "PV String Details", "Data Table", "Restore & TAT", "Audit Log"]
-    )
+    [
+        "Dashboard",
+        "PV String Details",
+        "Data Table",
+        "Restore & TAT",
+        "Audit Log",
+    ]
+)
 
     with tab1:
         if not filtered_df.empty:
-            main_dashboard_tab(filtered_df, sheet_df=df_selected, sheet_name=sheet_selection)
+            main_dashboard_tab(
+                filtered_df, sheet_df=df_selected, sheet_name=sheet_selection,
+                snapshot_date=selected_snapshot_date or latest_upload["snapshot_date"],
+            )
         else:
             st.warning("No data available with current filters and permissions")
 
@@ -2652,10 +3024,28 @@ def main():
             if inverter_col and inverter_col != "Inverter ID":
                 display_df = display_df.rename(columns={inverter_col: "Inverter ID"})
 
-            st.dataframe(display_df, use_container_width=True, column_config={
+            _, table_pv_current_cols = get_pv_string_columns_cached(filtered_df)
+            pv_cols_in_display = [c for c in table_pv_current_cols if c in display_df.columns]
+            column_config = {
                 "Availability (%)": st.column_config.ProgressColumn("Availability (%)", min_value=0, max_value=100, format="%.2f%%"),
-                "Failure Percentage (%)": st.column_config.NumberColumn("Failure Percentage (%)", format="%.2f%%")
-            })
+                "Failure Percentage (%)": st.column_config.NumberColumn("Failure Percentage (%)", format="%.2f%%"),
+            }
+
+            if pv_cols_in_display:
+                # Multi-tier Amp-based coloring (not just red/green) - same
+                # scale used elsewhere in the app: >5A / >3A / >1.5A / >0.5A / else.
+                def _pv_cell_color(x):
+                    if pd.notna(x) and isinstance(x, (int, float)):
+                        return f'background-color: {get_string_health_color(x)}; color: white; font-weight: bold;'
+                    return ''
+
+                styled_display = display_df.style
+                for col in pv_cols_in_display:
+                    styled_display = styled_display.map(_pv_cell_color, subset=[col])
+                st.caption("PV-I current coloring: Green >5A, Light Green >3A, Yellow >1.5A, Orange >0.5A, Red <=0.5A.")
+                st.dataframe(styled_display, use_container_width=True, column_config=column_config)
+            else:
+                st.dataframe(display_df, use_container_width=True, column_config=column_config)
 
             download_bytes = create_colored_excel_download({sheet_selection: filtered_df})
             st.download_button(
@@ -2675,6 +3065,7 @@ def main():
                 upload_handler=lambda file_bytes, filename, snap_date: process_and_save_upload(
                     file_bytes, filename, snap_date, current_user["username"], role
                 ) if is_admin() else (False, "Only admins can upload snapshots."),
+                snapshot_date=selected_snapshot_date or latest_upload["snapshot_date"],
             )
         else:
             st.warning("No data available for TAT analysis")
