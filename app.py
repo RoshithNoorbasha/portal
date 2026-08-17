@@ -11,6 +11,7 @@ from datetime import datetime
 from pathlib import Path
 import restore  # Restore & TAT module
 import storage1  # Shared backend storage (uploads, users, audit log)
+import analysis  # Multi-day SCADA string fault analysis page (admin/manager/super-admin only)
 from functools import lru_cache
 
 # ==========================================
@@ -2771,307 +2772,321 @@ def main():
                 st.rerun()
         st.stop()
 
-    # ---- Header: greeting + role badge, redesigned as a proper header bar ----
-    st.markdown(f"""
-    <div class="app-header">
-        <div class="app-header-left">
-            <div class="app-header-avatar">{avatar_initial}</div>
-            <div>
-                <p class="app-header-greeting">👋 Hi, {full_name}</p>
-                <div class="app-header-sub">Solar PV String Analytics · welcome back</div>
+    analysis_allowed = role in ("admin", "manager") or is_super
+
+    def _dashboard_page():
+        # ---- Header: greeting + role badge, redesigned as a proper header bar ----
+        st.markdown(f"""
+        <div class="app-header">
+            <div class="app-header-left">
+                <div class="app-header-avatar">{avatar_initial}</div>
+                <div>
+                    <p class="app-header-greeting">👋 Hi, {full_name}</p>
+                    <div class="app-header-sub">Solar PV String Analytics · welcome back</div>
+                </div>
+            </div>
+            <div class="app-header-right">
+                <span class="user-badge-{role}">{ROLE_BADGES.get(role, role)}</span>
             </div>
         </div>
-        <div class="app-header-right">
-            <span class="user-badge-{role}">{ROLE_BADGES.get(role, role)}</span>
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
+        """, unsafe_allow_html=True)
 
-    # ---- Sidebar ----
-    st.sidebar.markdown('<h2><i class="fas fa-bolt" style="color:#38bdf8;"></i> PV String Template</h2>', unsafe_allow_html=True)
+        # ---- Sidebar ----
+        st.sidebar.markdown('<h2><i class="fas fa-bolt" style="color:#38bdf8;"></i> PV String Template</h2>', unsafe_allow_html=True)
 
-    with st.sidebar.expander("👤 My Profile", expanded=False):
-        st.write(f"**Full Name:** {full_name}")
-        st.write(f"**Username:** {current_user['username']}")
-        st.write(f"**Role:** {ROLE_BADGES.get(role, role)}", unsafe_allow_html=True)
-        st.write(f"**Assigned Plots:** {', '.join(current_user.get('assigned_plots', [])) or 'None'}")
+        with st.sidebar.expander("👤 My Profile", expanded=False):
+            st.write(f"**Full Name:** {full_name}")
+            st.write(f"**Username:** {current_user['username']}")
+            st.write(f"**Role:** {ROLE_BADGES.get(role, role)}", unsafe_allow_html=True)
+            st.write(f"**Assigned Plots:** {', '.join(current_user.get('assigned_plots', [])) or 'None'}")
 
-        st.markdown("---")
-        st.write("**Change My Password**")
-        self_new_pw = st.text_input("New Password", type="password", key="self_pw_1")
-        self_new_pw_confirm = st.text_input("Confirm New Password", type="password", key="self_pw_2")
-        if st.button("Update Password", key="self_pw_update_btn"):
-            if not self_new_pw or self_new_pw != self_new_pw_confirm:
-                st.error("Passwords don't match or are empty.")
-            else:
-                ok, msg = storage1.reset_password(current_user["username"], self_new_pw)
-                if ok:
-                    storage1.log_audit_event(current_user["username"], role, "password_reset_self", {})
-                    st.success(msg)
+            st.markdown("---")
+            st.write("**Change My Password**")
+            self_new_pw = st.text_input("New Password", type="password", key="self_pw_1")
+            self_new_pw_confirm = st.text_input("Confirm New Password", type="password", key="self_pw_2")
+            if st.button("Update Password", key="self_pw_update_btn"):
+                if not self_new_pw or self_new_pw != self_new_pw_confirm:
+                    st.error("Passwords don't match or are empty.")
                 else:
-                    st.error(msg)
+                    ok, msg = storage1.reset_password(current_user["username"], self_new_pw)
+                    if ok:
+                        storage1.log_audit_event(current_user["username"], role, "password_reset_self", {})
+                        st.success(msg)
+                    else:
+                        st.error(msg)
 
-    st.sidebar.markdown(f"**User:** {current_user['username']} ({ROLE_BADGES.get(role, role)})", unsafe_allow_html=True)
+        st.sidebar.markdown(f"**User:** {current_user['username']} ({ROLE_BADGES.get(role, role)})", unsafe_allow_html=True)
 
-    if st.sidebar.button(" Logout", use_container_width=True):
-        storage1.log_audit_event(current_user["username"], role, "logout", {})
-        storage1.invalidate_session(st.session_state.get("session_token"))
-        try:
-            del st.query_params["sid"]
-        except Exception:
-            pass
-        st.session_state.authenticated = False
-        st.session_state.user = None
-        st.session_state.session_token = None
-        st.rerun()
+        if st.sidebar.button(" Logout", use_container_width=True):
+            storage1.log_audit_event(current_user["username"], role, "logout", {})
+            storage1.invalidate_session(st.session_state.get("session_token"))
+            try:
+                del st.query_params["sid"]
+            except Exception:
+                pass
+            st.session_state.authenticated = False
+            st.session_state.user = None
+            st.session_state.session_token = None
+            st.rerun()
 
-    st.sidebar.markdown("---")
+        st.sidebar.markdown("---")
 
-    # ---- Maintenance mode control (super admin only) ----
-    if is_super:
-        if maintenance.get("enabled"):
-            st.warning(
-                f"🚧 Maintenance mode is **ON** (enabled by {maintenance.get('enabled_by', 'unknown')}). "
-                "Every other user is currently blocked from the app."
-            )
-        with st.sidebar.expander("🛠️ Maintenance Mode (Super Admin)", expanded=False):
-            st.caption("While enabled, every user except super admins sees a maintenance popup and can't use the app.")
-            maint_message = st.text_input(
-                "Popup message", value=maintenance.get("message") or storage1.DEFAULT_MAINTENANCE_MESSAGE,
-                key="maintenance_message_input",
-            )
-            m_col1, m_col2 = st.columns(2)
-            with m_col1:
-                if not maintenance.get("enabled"):
-                    if st.button("🚧 Enable Maintenance Mode", use_container_width=True, key="enable_maintenance_btn"):
-                        storage1.set_maintenance_mode(True, current_user["username"], maint_message)
-                        storage1.log_audit_event(current_user["username"], role, "maintenance_mode_enabled", {"message": maint_message})
-                        st.rerun()
-            with m_col2:
-                if maintenance.get("enabled"):
-                    if st.button("✅ Disable Maintenance Mode", use_container_width=True, key="disable_maintenance_btn"):
-                        storage1.set_maintenance_mode(False, current_user["username"])
-                        storage1.log_audit_event(current_user["username"], role, "maintenance_mode_disabled", {})
-                        st.rerun()
-
-    st.sidebar.markdown("---")
-
-    # ---- File upload (admin only) ----
-    st.sidebar.subheader("📁 File Management")
-
-    if is_admin():
-        latest_upload = storage1.get_latest_upload()
-        if latest_upload:
-            st.sidebar.info(f"Current file: {latest_upload['original_filename']}\n"
-                             f"Snapshot date: {latest_upload['snapshot_date']}\n"
-                             f"Uploaded: {latest_upload['upload_timestamp']}")
-
-        snapshot_date = st.sidebar.date_input("Snapshot date for this upload", value=datetime.now().date())
-        uploaded_file = st.sidebar.file_uploader("Upload new SCADA Report (.xlsx)", type=["xlsx"])
-        if uploaded_file:
-            file_bytes = uploaded_file.getvalue()
-            file_hash = hashlib.md5(file_bytes).hexdigest()
-            # The file_uploader widget keeps holding its last value even
-            # after st.rerun(), so without this guard the same file kept
-            # getting reprocessed (and re-logged to the audit log) on every
-            # single rerun - looping "file_uploaded" events. Only process a
-            # given file once per browser session unless it actually changes.
-            upload_signature = f"{snapshot_date}:{file_hash}"
-            already_processed = st.session_state.get("last_processed_upload_signature") == upload_signature
-            if not already_processed:
-                ok, msg = process_and_save_upload(
-                    file_bytes, uploaded_file.name, snapshot_date,
-                    current_user["username"], role,
+        # ---- Maintenance mode control (super admin only) ----
+        if is_super:
+            if maintenance.get("enabled"):
+                st.warning(
+                    f"🚧 Maintenance mode is **ON** (enabled by {maintenance.get('enabled_by', 'unknown')}). "
+                    "Every other user is currently blocked from the app."
                 )
-                if ok:
-                    st.session_state.last_processed_upload_signature = upload_signature
-                    st.session_state.header_snapshot_date = str(snapshot_date)
-                    st.sidebar.success(msg)
-                    st.rerun()
-                else:
-                    st.sidebar.error(msg)
-    else:
-        latest_upload = storage1.get_latest_upload()
-        if latest_upload:
-            st.sidebar.info(f"Current file: {latest_upload['original_filename']}")
-            st.sidebar.caption(f"Snapshot date: {latest_upload['snapshot_date']}")
+            with st.sidebar.expander("🛠️ Maintenance Mode (Super Admin)", expanded=False):
+                st.caption("While enabled, every user except super admins sees a maintenance popup and can't use the app.")
+                maint_message = st.text_input(
+                    "Popup message", value=maintenance.get("message") or storage1.DEFAULT_MAINTENANCE_MESSAGE,
+                    key="maintenance_message_input",
+                )
+                m_col1, m_col2 = st.columns(2)
+                with m_col1:
+                    if not maintenance.get("enabled"):
+                        if st.button("🚧 Enable Maintenance Mode", use_container_width=True, key="enable_maintenance_btn"):
+                            storage1.set_maintenance_mode(True, current_user["username"], maint_message)
+                            storage1.log_audit_event(current_user["username"], role, "maintenance_mode_enabled", {"message": maint_message})
+                            st.rerun()
+                with m_col2:
+                    if maintenance.get("enabled"):
+                        if st.button("✅ Disable Maintenance Mode", use_container_width=True, key="disable_maintenance_btn"):
+                            storage1.set_maintenance_mode(False, current_user["username"])
+                            storage1.log_audit_event(current_user["username"], role, "maintenance_mode_disabled", {})
+                            st.rerun()
+
+        st.sidebar.markdown("---")
+
+        # ---- File upload (admin only) ----
+        st.sidebar.subheader("📁 File Management")
+
+        if is_admin():
+            latest_upload = storage1.get_latest_upload()
+            if latest_upload:
+                st.sidebar.info(f"Current file: {latest_upload['original_filename']}\n"
+                                 f"Snapshot date: {latest_upload['snapshot_date']}\n"
+                                 f"Uploaded: {latest_upload['upload_timestamp']}")
+
+            snapshot_date = st.sidebar.date_input("Snapshot date for this upload", value=datetime.now().date())
+            uploaded_file = st.sidebar.file_uploader("Upload new SCADA Report (.xlsx)", type=["xlsx"])
+            if uploaded_file:
+                file_bytes = uploaded_file.getvalue()
+                file_hash = hashlib.md5(file_bytes).hexdigest()
+                # The file_uploader widget keeps holding its last value even
+                # after st.rerun(), so without this guard the same file kept
+                # getting reprocessed (and re-logged to the audit log) on every
+                # single rerun - looping "file_uploaded" events. Only process a
+                # given file once per browser session unless it actually changes.
+                upload_signature = f"{snapshot_date}:{file_hash}"
+                already_processed = st.session_state.get("last_processed_upload_signature") == upload_signature
+                if not already_processed:
+                    ok, msg = process_and_save_upload(
+                        file_bytes, uploaded_file.name, snapshot_date,
+                        current_user["username"], role,
+                    )
+                    if ok:
+                        st.session_state.last_processed_upload_signature = upload_signature
+                        st.session_state.header_snapshot_date = str(snapshot_date)
+                        st.sidebar.success(msg)
+                        st.rerun()
+                    else:
+                        st.sidebar.error(msg)
         else:
-            st.sidebar.warning("No file available. Please contact admin.")
+            latest_upload = storage1.get_latest_upload()
+            if latest_upload:
+                st.sidebar.info(f"Current file: {latest_upload['original_filename']}")
+                st.sidebar.caption(f"Snapshot date: {latest_upload['snapshot_date']}")
+            else:
+                st.sidebar.warning("No file available. Please contact admin.")
 
-    st.sidebar.markdown("---")
+        st.sidebar.markdown("---")
 
-    # ---- Load current data ----
-    latest_upload = storage1.get_latest_upload()
-    if not latest_upload:
-        st.info("No SCADA file available. Please contact admin to upload one.")
-        return
-
-    # ---- Header calendar: browse any previously preprocessed snapshot date ----
-    selected_snapshot_date, using_latest = render_header_calendar()
-
-    if selected_snapshot_date and not using_latest:
-        processed_dataframes, snapshot_entry = storage1.get_processed_dataframes_for_date(selected_snapshot_date)
-        if not processed_dataframes:
-            st.warning(f"No preprocessed data could be loaded for {selected_snapshot_date}. Showing the latest snapshot instead.")
-            processed_dataframes = None
-    else:
-        processed_dataframes = None
-
-    if processed_dataframes is None:
-        # Only the processed CSVs are kept on disk (storage optimization -
-        # the original .xlsx is never persisted), so the "latest" snapshot
-        # is loaded the same way any other snapshot date is: straight from
-        # its already-preprocessed CSVs, with no re-parsing needed.
-        processed_dataframes, _ = storage1.get_processed_dataframes_for_date(latest_upload["snapshot_date"])
-        if not processed_dataframes:
-            st.error("Could not load the latest snapshot's preprocessed data from backend storage.")
+        # ---- Load current data ----
+        latest_upload = storage1.get_latest_upload()
+        if not latest_upload:
+            st.info("No SCADA file available. Please contact admin to upload one.")
             return
 
-    if role == "engineer":
-        allowed_plots = current_user.get("assigned_plots", [])
-        if allowed_plots:
-            st.sidebar.markdown("---")
-            st.sidebar.subheader("Assigned Plots")
-            st.sidebar.write(", ".join(allowed_plots))
+        # ---- Header calendar: browse any previously preprocessed snapshot date ----
+        selected_snapshot_date, using_latest = render_header_calendar()
 
-    sheet_selection = st.sidebar.selectbox("Select Sheet", list(processed_dataframes.keys()))
-    df_selected = processed_dataframes[sheet_selection].copy()
-
-    if role == "engineer":
-        allowed_plots = current_user.get("assigned_plots", [])
-        if allowed_plots:
-            df_selected = df_selected[df_selected["Plot"].isin(allowed_plots)]
-
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("🔎 Filters")
-
-    # Initialize sidebar filters in session state
-    if "sidebar_filters" not in st.session_state:
-        st.session_state.sidebar_filters = {
-            "plot": "All",
-            "block": "All",
-            "sacu": "All"
-        }
-
-    plots = ["All"] + sorted_filter_options(df_selected["Plot"])
-    selected_plot = st.sidebar.selectbox(
-        "Plot",
-        plots,
-        index=0 if st.session_state.sidebar_filters["plot"] == "All" else plots.index(st.session_state.sidebar_filters["plot"]) if st.session_state.sidebar_filters["plot"] in plots else 0
-    )
-    st.session_state.sidebar_filters["plot"] = selected_plot
-
-    filtered_df = df_selected.copy()
-    if selected_plot != "All":
-        filtered_df = filtered_df[filtered_df["Plot"] == selected_plot]
-
-    blocks = ["All"] + sorted_filter_options(filtered_df["Block"])
-    selected_block = st.sidebar.selectbox(
-        "Block",
-        blocks,
-        index=0 if st.session_state.sidebar_filters["block"] == "All" else blocks.index(st.session_state.sidebar_filters["block"]) if st.session_state.sidebar_filters["block"] in blocks else 0
-    )
-    st.session_state.sidebar_filters["block"] = selected_block
-
-    if selected_block != "All":
-        filtered_df = filtered_df[filtered_df["Block"] == selected_block]
-
-    sacus = ["All"] + sorted_filter_options(filtered_df["SACU"])
-    selected_sacu = st.sidebar.selectbox(
-        "SACU",
-        sacus,
-        index=0 if st.session_state.sidebar_filters["sacu"] == "All" else sacus.index(st.session_state.sidebar_filters["sacu"]) if st.session_state.sidebar_filters["sacu"] in sacus else 0
-    )
-    st.session_state.sidebar_filters["sacu"] = selected_sacu
-
-    if selected_sacu != "All":
-        filtered_df = filtered_df[filtered_df["SACU"] == selected_sacu]
-
-    # ---- User management (admin / manager) ----
-    user_management_ui()
-
-    inverter_col = get_inverter_column_cached(filtered_df)
-
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(
-    [
-        "Dashboard",
-        "PV String Details",
-        "Data Table",
-        "Restore & TAT",
-        "Audit Log",
-    ]
-)
-
-    with tab1:
-        if not filtered_df.empty:
-            main_dashboard_tab(
-                filtered_df, sheet_df=df_selected, sheet_name=sheet_selection,
-                snapshot_date=selected_snapshot_date or latest_upload["snapshot_date"],
-            )
+        if selected_snapshot_date and not using_latest:
+            processed_dataframes, snapshot_entry = storage1.get_processed_dataframes_for_date(selected_snapshot_date)
+            if not processed_dataframes:
+                st.warning(f"No preprocessed data could be loaded for {selected_snapshot_date}. Showing the latest snapshot instead.")
+                processed_dataframes = None
         else:
-            st.warning("No data available with current filters and permissions")
+            processed_dataframes = None
 
-    with tab2:
-        if not filtered_df.empty:
-            create_pv_string_tab(filtered_df)
-        else:
-            st.warning("No data available for PV string analysis")
+        if processed_dataframes is None:
+            # Only the processed CSVs are kept on disk (storage optimization -
+            # the original .xlsx is never persisted), so the "latest" snapshot
+            # is loaded the same way any other snapshot date is: straight from
+            # its already-preprocessed CSVs, with no re-parsing needed.
+            processed_dataframes, _ = storage1.get_processed_dataframes_for_date(latest_upload["snapshot_date"])
+            if not processed_dataframes:
+                st.error("Could not load the latest snapshot's preprocessed data from backend storage.")
+                return
 
-    with tab3:
-        st.subheader("Inverter Data Table")
-        if not filtered_df.empty:
-            display_df = filtered_df.copy()
-            if inverter_col and inverter_col != "Inverter ID":
-                display_df = display_df.rename(columns={inverter_col: "Inverter ID"})
+        if role == "engineer":
+            allowed_plots = current_user.get("assigned_plots", [])
+            if allowed_plots:
+                st.sidebar.markdown("---")
+                st.sidebar.subheader("Assigned Plots")
+                st.sidebar.write(", ".join(allowed_plots))
 
-            _, table_pv_current_cols = get_pv_string_columns_cached(filtered_df)
-            pv_cols_in_display = [c for c in table_pv_current_cols if c in display_df.columns]
-            column_config = {
-                "Availability (%)": st.column_config.ProgressColumn("Availability (%)", min_value=0, max_value=100, format="%.2f%%"),
-                "Failure Percentage (%)": st.column_config.NumberColumn("Failure Percentage (%)", format="%.2f%%"),
+        sheet_selection = st.sidebar.selectbox("Select Sheet", list(processed_dataframes.keys()))
+        df_selected = processed_dataframes[sheet_selection].copy()
+
+        if role == "engineer":
+            allowed_plots = current_user.get("assigned_plots", [])
+            if allowed_plots:
+                df_selected = df_selected[df_selected["Plot"].isin(allowed_plots)]
+
+        st.sidebar.markdown("---")
+        st.sidebar.subheader("🔎 Filters")
+
+        # Initialize sidebar filters in session state
+        if "sidebar_filters" not in st.session_state:
+            st.session_state.sidebar_filters = {
+                "plot": "All",
+                "block": "All",
+                "sacu": "All"
             }
 
-            if pv_cols_in_display:
-                # Multi-tier Amp-based coloring (not just red/green) - same
-                # scale used elsewhere in the app: >5A / >3A / >1.5A / >0.5A / else.
-                def _pv_cell_color(x):
-                    if pd.notna(x) and isinstance(x, (int, float)):
-                        return f'background-color: {get_string_health_color(x)}; color: white; font-weight: bold;'
-                    return ''
+        plots = ["All"] + sorted_filter_options(df_selected["Plot"])
+        selected_plot = st.sidebar.selectbox(
+            "Plot",
+            plots,
+            index=0 if st.session_state.sidebar_filters["plot"] == "All" else plots.index(st.session_state.sidebar_filters["plot"]) if st.session_state.sidebar_filters["plot"] in plots else 0
+        )
+        st.session_state.sidebar_filters["plot"] = selected_plot
 
-                styled_display = display_df.style
-                for col in pv_cols_in_display:
-                    styled_display = styled_display.map(_pv_cell_color, subset=[col])
-                st.caption("PV-I current coloring: Green >5A, Light Green >3A, Yellow >1.5A, Orange >0.5A, Red <=0.5A.")
-                st.dataframe(styled_display, use_container_width=True, column_config=column_config)
+        filtered_df = df_selected.copy()
+        if selected_plot != "All":
+            filtered_df = filtered_df[filtered_df["Plot"] == selected_plot]
+
+        blocks = ["All"] + sorted_filter_options(filtered_df["Block"])
+        selected_block = st.sidebar.selectbox(
+            "Block",
+            blocks,
+            index=0 if st.session_state.sidebar_filters["block"] == "All" else blocks.index(st.session_state.sidebar_filters["block"]) if st.session_state.sidebar_filters["block"] in blocks else 0
+        )
+        st.session_state.sidebar_filters["block"] = selected_block
+
+        if selected_block != "All":
+            filtered_df = filtered_df[filtered_df["Block"] == selected_block]
+
+        sacus = ["All"] + sorted_filter_options(filtered_df["SACU"])
+        selected_sacu = st.sidebar.selectbox(
+            "SACU",
+            sacus,
+            index=0 if st.session_state.sidebar_filters["sacu"] == "All" else sacus.index(st.session_state.sidebar_filters["sacu"]) if st.session_state.sidebar_filters["sacu"] in sacus else 0
+        )
+        st.session_state.sidebar_filters["sacu"] = selected_sacu
+
+        if selected_sacu != "All":
+            filtered_df = filtered_df[filtered_df["SACU"] == selected_sacu]
+
+        # ---- User management (admin / manager) ----
+        user_management_ui()
+
+        inverter_col = get_inverter_column_cached(filtered_df)
+
+        tab1, tab2, tab3, tab4, tab5 = st.tabs(
+        [
+            "Dashboard",
+            "PV String Details",
+            "Data Table",
+            "Restore & TAT",
+            "Audit Log",
+        ]
+    )
+
+        with tab1:
+            if not filtered_df.empty:
+                main_dashboard_tab(
+                    filtered_df, sheet_df=df_selected, sheet_name=sheet_selection,
+                    snapshot_date=selected_snapshot_date or latest_upload["snapshot_date"],
+                )
             else:
-                st.dataframe(display_df, use_container_width=True, column_config=column_config)
+                st.warning("No data available with current filters and permissions")
 
-            download_bytes = create_colored_excel_download({sheet_selection: filtered_df})
-            st.download_button(
-                label="Download Filtered Excel (color-coded)", data=download_bytes,
-                file_name=f"processed_{sheet_selection}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                on_click=_log_download, args=(f"filtered_excel:{sheet_selection}",),
-            )
-        else:
-            st.info("No data available")
+        with tab2:
+            if not filtered_df.empty:
+                create_pv_string_tab(filtered_df)
+            else:
+                st.warning("No data available for PV string analysis")
 
-    with tab4:
-        if not filtered_df.empty:
-            restore.get_restore_tab(
-                processed_dataframes, filtered_df,
-                sheet_name=sheet_selection, user_role=role, username=current_user["username"],
-                upload_handler=lambda file_bytes, filename, snap_date: process_and_save_upload(
-                    file_bytes, filename, snap_date, current_user["username"], role
-                ) if is_admin() else (False, "Only admins can upload snapshots."),
-                snapshot_date=selected_snapshot_date or latest_upload["snapshot_date"],
-            )
-        else:
-            st.warning("No data available for TAT analysis")
+        with tab3:
+            st.subheader("Inverter Data Table")
+            if not filtered_df.empty:
+                display_df = filtered_df.copy()
+                if inverter_col and inverter_col != "Inverter ID":
+                    display_df = display_df.rename(columns={inverter_col: "Inverter ID"})
 
-    with tab5:
-        audit_log_tab()
+                _, table_pv_current_cols = get_pv_string_columns_cached(filtered_df)
+                pv_cols_in_display = [c for c in table_pv_current_cols if c in display_df.columns]
+                column_config = {
+                    "Availability (%)": st.column_config.ProgressColumn("Availability (%)", min_value=0, max_value=100, format="%.2f%%"),
+                    "Failure Percentage (%)": st.column_config.NumberColumn("Failure Percentage (%)", format="%.2f%%"),
+                }
+
+                if pv_cols_in_display:
+                    # Multi-tier Amp-based coloring (not just red/green) - same
+                    # scale used elsewhere in the app: >5A / >3A / >1.5A / >0.5A / else.
+                    def _pv_cell_color(x):
+                        if pd.notna(x) and isinstance(x, (int, float)):
+                            return f'background-color: {get_string_health_color(x)}; color: white; font-weight: bold;'
+                        return ''
+
+                    styled_display = display_df.style
+                    for col in pv_cols_in_display:
+                        styled_display = styled_display.map(_pv_cell_color, subset=[col])
+                    st.caption("PV-I current coloring: Green >5A, Light Green >3A, Yellow >1.5A, Orange >0.5A, Red <=0.5A.")
+                    st.dataframe(styled_display, use_container_width=True, column_config=column_config)
+                else:
+                    st.dataframe(display_df, use_container_width=True, column_config=column_config)
+
+                download_bytes = create_colored_excel_download({sheet_selection: filtered_df})
+                st.download_button(
+                    label="Download Filtered Excel (color-coded)", data=download_bytes,
+                    file_name=f"processed_{sheet_selection}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    on_click=_log_download, args=(f"filtered_excel:{sheet_selection}",),
+                )
+            else:
+                st.info("No data available")
+
+        with tab4:
+            if not filtered_df.empty:
+                restore.get_restore_tab(
+                    processed_dataframes, filtered_df,
+                    sheet_name=sheet_selection, user_role=role, username=current_user["username"],
+                    upload_handler=lambda file_bytes, filename, snap_date: process_and_save_upload(
+                        file_bytes, filename, snap_date, current_user["username"], role
+                    ) if is_admin() else (False, "Only admins can upload snapshots."),
+                    snapshot_date=selected_snapshot_date or latest_upload["snapshot_date"],
+                )
+            else:
+                st.warning("No data available for TAT analysis")
+
+        with tab5:
+            audit_log_tab()
+
+    pages = [
+        st.Page(_dashboard_page, title="Dashboard", icon=":material/dashboard:", url_path="dashboard", default=True),
+    ]
+    if analysis_allowed:
+        pages.append(
+            st.Page(lambda: analysis.render_analysis_page(current_user), title="Analysis", icon=":material/query_stats:", url_path="analysis")
+        )
+
+    pg = st.navigation(pages, position="sidebar")
+    pg.run()
 
 if __name__ == "__main__":
     main()
