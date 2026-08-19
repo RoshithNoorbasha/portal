@@ -240,6 +240,21 @@ def render_analysis_page(current_user):
     ]
     DAY_LABELS = ["Day1", "Day2", "Day3"]
 
+    # Sheet keys + display labels offered on the Export tab, and used by
+    # generate_excel_report's `included_sheets` filter (requirement #3).
+    EXPORT_SHEET_OPTIONS = [
+        ("dashboard", "Dashboard (KPIs + Plot-wise status)"),
+        ("trend", "3-Day Trend"),
+        ("plot_summary", "Plot Summary"),
+        ("block_summary", "Block Summary"),
+        ("inverter_matrix", "Inverter Matrix"),
+        ("failed", "Failed Strings"),
+        ("refailed", "Re-Failed Strings"),
+        ("negative", "Negative Values"),
+        ("low_perf", "Low Performance"),
+        ("duplicates", "Duplicate Inverters"),
+    ]
+
     # ============================================================================
     # SESSION STATE
     # ============================================================================
@@ -745,6 +760,95 @@ def render_analysis_page(current_user):
         return inverter_status, plot_summary, block_summary, df_newly_failed, df_refailed, kpis
 
 
+    def compute_daily_totals(processed_days: dict, day_keys: list, date_mapping: dict):
+        """Roll each day's already-deduplicated sheet up into one summary row,
+        so the dashboard can show a 3-day (or 1-3 day) trend at a glance."""
+        rows = []
+        for dk in day_keys:
+            df_day = processed_days.get(dk)
+            if df_day is None or df_day.empty:
+                continue
+            total_active = int(pd.to_numeric(df_day.get("Total Active Strings"), errors="coerce").fillna(0).sum())
+            working = int(pd.to_numeric(df_day.get("Working String Count"), errors="coerce").fillna(0).sum())
+            failed = int(pd.to_numeric(df_day.get("Failed String Count"), errors="coerce").fillna(0).sum())
+            inverters = int(df_day["String Inverter"].nunique()) if "String Inverter" in df_day.columns else 0
+            availability = round((working / total_active * 100), 2) if total_active else 0.0
+            failure_pct = round((failed / total_active * 100), 2) if total_active else 0.0
+            date_raw = date_mapping.get(dk, dk)
+            try:
+                date_display = pd.to_datetime(date_raw).strftime("%d %b %Y")
+            except Exception:
+                date_display = str(date_raw)
+            rows.append({
+                "Day": dk, "Date": date_display, "Inverters": inverters,
+                "Total Active Strings": total_active, "Working Strings": working,
+                "Failed Strings": failed, "Availability %": availability, "Failure %": failure_pct,
+            })
+        return pd.DataFrame(rows)
+
+
+    def build_inverter_matrix(processed_days: dict, comparison_day_keys: list, date_mapping: dict):
+        """Per-inverter, per-day Working String Count grid (requirement: 'Inverter Matrix').
+
+        One row per inverter, one column per comparison day holding that day's Working
+        String Count, plus the inverter's Total Active Strings so each day-cell can be
+        colored: green when the inverter is fully working that day, amber for a small
+        shortfall, red for a larger one - so a viewer can see a string count go
+        19 -> 18 -> 19 (drop, then recovery) at a glance across the day columns.
+
+        Returns (matrix_df, day_col_labels) where day_col_labels are the actual column
+        names used for each day (formatted with the date, e.g. "Day1\\n(12 Aug)").
+        """
+        day_col_labels = []
+        frames = []
+        for dk in comparison_day_keys:
+            df_day = processed_days.get(dk)
+            if df_day is None or df_day.empty or "String Inverter" not in df_day.columns:
+                continue
+            date_raw = date_mapping.get(dk, dk)
+            try:
+                date_disp = pd.to_datetime(date_raw).strftime("%d %b")
+            except Exception:
+                date_disp = str(date_raw)
+            col_label = f"{dk} ({date_disp})"
+            day_col_labels.append(col_label)
+            cols = [c for c in ["String Inverter", "Plot", "Block", "Working String Count"] if c in df_day.columns]
+            sub = df_day[cols].rename(columns={"Working String Count": col_label})
+            frames.append(sub)
+
+        if not frames:
+            return pd.DataFrame(), []
+
+        result = frames[0]
+        for sub in frames[1:]:
+            join_cols = [c for c in ["String Inverter", "Plot", "Block"] if c in result.columns and c in sub.columns]
+            result = result.merge(sub, on=join_cols, how="outer")
+
+        latest_key = comparison_day_keys[-1]
+        latest_df = processed_days.get(latest_key)
+        if latest_df is not None and "Total Active Strings" in latest_df.columns:
+            totals = latest_df[["String Inverter", "Total Active Strings"]].drop_duplicates("String Inverter")
+            result = result.merge(totals, on="String Inverter", how="left")
+        else:
+            result["Total Active Strings"] = pd.NA
+
+        for c in day_col_labels + ["Total Active Strings"]:
+            if c in result.columns:
+                result[c] = pd.to_numeric(result[c], errors="coerce")
+
+        if len(day_col_labels) >= 2:
+            result["Change"] = result[day_col_labels[-1]] - result[day_col_labels[0]]
+
+        ordered = [c for c in ["Plot", "Block", "String Inverter", "Total Active Strings"] if c in result.columns]
+        ordered += day_col_labels
+        if "Change" in result.columns:
+            ordered.append("Change")
+        result = result[ordered]
+        sort_cols = [c for c in ["Plot", "Block", "String Inverter"] if c in result.columns]
+        result = result.sort_values(sort_cols).reset_index(drop=True)
+        return result, day_col_labels
+
+
     # ============================================================================
     # EXCEL REPORT GENERATION  (condensed port of the "Professional Edition" report)
     # ============================================================================
@@ -776,11 +880,16 @@ def render_analysis_page(current_user):
     def _style_header(ws, row, start_col, end_col, color):
         for col in range(start_col, end_col + 1):
             cell = ws.cell(row, col)
-            cell.font = Font(name="Calibri", size=10, bold=True, color="FFFFFF")
+            cell.font = Font(name="Calibri", size=10.5, bold=True, color="FFFFFF")
             cell.fill = _fill(color)
             cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-            cell.border = _thin_border()
-        ws.row_dimensions[row].height = 28
+            cell.border = Border(
+                left=Side(style="thin", color=COLORS["light_grey"].lstrip("#")),
+                right=Side(style="thin", color=COLORS["light_grey"].lstrip("#")),
+                top=Side(style="medium", color=color.lstrip("#")),
+                bottom=Side(style="medium", color=color.lstrip("#")),
+            )
+        ws.row_dimensions[row].height = 30
 
 
     def _auto_width(ws, max_width=32):
@@ -795,30 +904,45 @@ def render_analysis_page(current_user):
             ws.column_dimensions[letter].width = min(max(length + 3, 12), max_width)
 
 
-    def _write_table(ws, df, start_row, header_color, highlight_map=None):
-        """Write a DataFrame as a styled table starting at start_row (1-indexed header row)."""
+    def _write_table(ws, df, start_row, header_color, highlight_map=None, zebra=True):
+        """Write a DataFrame as a styled table starting at start_row (1-indexed header row).
+        Rows alternate a very light tint (zebra striping) for readability, except in cells
+        that already carry a semantic highlight (working/failed/etc)."""
         highlight_map = highlight_map or {}
+        zebra_fill = _fill("F7FAFC")
         for col_num, col_name in enumerate(df.columns, start=1):
             ws.cell(start_row, col_num, col_name)
         _style_header(ws, start_row, 1, len(df.columns), header_color)
 
-        for r_off, row in enumerate(df.itertuples(index=False, name=None), start=start_row + 1):
+        for i, row in enumerate(df.itertuples(index=False, name=None)):
+            r_off = start_row + 1 + i
+            is_even = (i % 2 == 1)
             for col_num, value in enumerate(row, start=1):
                 cell = ws.cell(r_off, col_num, value)
+                cell.font = Font(name="Calibri", size=10)
                 cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
                 cell.border = _thin_border()
                 col_name = df.columns[col_num - 1]
                 if col_name in highlight_map:
                     fill_c, font_c = highlight_map[col_name]
                     cell.fill = _fill(fill_c)
-                    cell.font = Font(bold=True, color=font_c.lstrip("#"))
+                    cell.font = Font(name="Calibri", size=10, bold=True, color=font_c.lstrip("#"))
+                elif zebra and is_even:
+                    cell.fill = zebra_fill
+            ws.row_dimensions[r_off].height = 20
         return start_row + len(df)
 
 
     def generate_excel_report(kpis, plot_summary, block_summary, df_newly_failed, df_refailed,
                                inverter_status, comparison_day_keys, date_mapping, threshold,
                                df_negative_current=None, df_low_perf=None, duplicate_ids_by_day=None,
-                               excluded_ids_by_day=None):
+                               excluded_ids_by_day=None, daily_totals=None, inverter_matrix_df=None,
+                               matrix_day_cols=None, included_sheets=None):
+        """Build the multi-sheet Excel report. `included_sheets` is a set of sheet keys
+        to include (see EXPORT_SHEET_OPTIONS below); None means "include everything"."""
+        all_keys = {k for k, _ in EXPORT_SHEET_OPTIONS}
+        included_sheets = all_keys if included_sheets is None else set(included_sheets)
+
         wb = Workbook()
         wb.remove(wb.active)
         number_of_days = len(comparison_day_keys)
@@ -830,32 +954,33 @@ def render_analysis_page(current_user):
             latest_date_display = str(latest_date_raw)
 
         # --- Dashboard sheet -----------------------------------------------
-        ws = wb.create_sheet("Dashboard")
-        _style_title(ws, "PNP PLANT OPERATIONAL DASHBOARD", 8,
-                     f"Latest Date: {latest_date_display} | {number_of_days}-Day Reference | Threshold <= {threshold} A")
+        if "dashboard" in included_sheets:
+            ws = wb.create_sheet("Dashboard")
+            _style_title(ws, "PNP PLANT OPERATIONAL DASHBOARD", 8,
+                         f"Latest Date: {latest_date_display} | {number_of_days}-Day Reference | Threshold <= {threshold} A")
 
-        kpi_cards = [
-            ("TOTAL INVERTERS", kpis["total_inverters"], COLORS["primary_blue"]),
-            ("ACTIVE STRINGS", kpis["total_active_strings"], COLORS["info_purple"]),
-            ("WORKING STRINGS", kpis["working_strings"], COLORS["success_green"]),
-            ("FAILED/PENDING STRINGS", kpis["failed_strings"], COLORS["danger_red"]),
-            ("NEWLY FAILED", kpis["newly_failed_strings"], COLORS["warning_orange"]),
-            ("RE-FAILED", kpis["refailed_strings"], COLORS["danger_red"]),
-            ("AVAILABILITY", f"{kpis['availability']:.2f}%", COLORS["success_green"]),
-            ("FAILURE RATE", f"{kpis['failure_pct']:.2f}%", COLORS["danger_red"]),
-        ]
-        for idx, (label, value, color) in enumerate(kpi_cards):
-            row = 4 + (idx // 4) * 3
-            col = 1 + (idx % 4) * 2
-            ws.merge_cells(start_row=row, start_column=col, end_row=row, end_column=col + 1)
-            ws.merge_cells(start_row=row + 1, start_column=col, end_row=row + 1, end_column=col + 1)
-            lc = ws.cell(row, col, label)
-            lc.font = Font(size=9, bold=True, color="FFFFFF")
-            lc.fill = _fill(color)
-            lc.alignment = Alignment(horizontal="center")
-            vc = ws.cell(row + 1, col, value)
-            vc.font = Font(size=16, bold=True, color=color.lstrip("#"))
-            vc.alignment = Alignment(horizontal="center")
+            kpi_cards = [
+                ("TOTAL INVERTERS", kpis["total_inverters"], COLORS["primary_blue"]),
+                ("ACTIVE STRINGS", kpis["total_active_strings"], COLORS["info_purple"]),
+                ("WORKING STRINGS", kpis["working_strings"], COLORS["success_green"]),
+                ("FAILED/PENDING STRINGS", kpis["failed_strings"], COLORS["danger_red"]),
+                ("NEWLY FAILED", kpis["newly_failed_strings"], COLORS["warning_orange"]),
+                ("RE-FAILED", kpis["refailed_strings"], COLORS["danger_red"]),
+                ("AVAILABILITY", f"{kpis['availability']:.2f}%", COLORS["success_green"]),
+                ("FAILURE RATE", f"{kpis['failure_pct']:.2f}%", COLORS["danger_red"]),
+            ]
+            for idx, (label, value, color) in enumerate(kpi_cards):
+                row = 4 + (idx // 4) * 3
+                col = 1 + (idx % 4) * 2
+                ws.merge_cells(start_row=row, start_column=col, end_row=row, end_column=col + 1)
+                ws.merge_cells(start_row=row + 1, start_column=col, end_row=row + 1, end_column=col + 1)
+                lc = ws.cell(row, col, label)
+                lc.font = Font(size=9, bold=True, color="FFFFFF")
+                lc.fill = _fill(color)
+                lc.alignment = Alignment(horizontal="center")
+                vc = ws.cell(row + 1, col, value)
+                vc.font = Font(size=16, bold=True, color=color.lstrip("#"))
+                vc.alignment = Alignment(horizontal="center")
 
         highlight = {
             "Working Strings": (COLORS["success_light"], COLORS["success_green"]),
@@ -863,83 +988,152 @@ def render_analysis_page(current_user):
             "Newly Failed Strings": (COLORS["warning_light"], COLORS["warning_orange"]),
             "Re-Failed Strings": (COLORS["info_light"], COLORS["info_purple"]),
         }
-        ws.cell(11, 1, "PLOT-WISE CURRENT STATUS").font = Font(size=13, bold=True, color="FFFFFF")
-        ws.cell(11, 1).fill = _fill(COLORS["primary_blue"])
-        ws.merge_cells(start_row=11, start_column=1, end_row=11, end_column=9)
-        if not plot_summary.empty:
-            _write_table(ws, plot_summary, 12, COLORS["dark_grey"], highlight)
-        _auto_width(ws)
-        ws.freeze_panes = "A13"
+        if "dashboard" in included_sheets:
+            ws.cell(11, 1, "PLOT-WISE CURRENT STATUS").font = Font(size=13, bold=True, color="FFFFFF")
+            ws.cell(11, 1).fill = _fill(COLORS["primary_blue"])
+            ws.merge_cells(start_row=11, start_column=1, end_row=11, end_column=9)
+            if not plot_summary.empty:
+                _write_table(ws, plot_summary, 12, COLORS["dark_grey"], highlight)
+            _auto_width(ws)
+            ws.freeze_panes = "A13"
+
+        # --- 3-Day Trend sheet --------------------------------------------
+        if "trend" in included_sheets:
+            ws_trend = wb.create_sheet("3-Day Trend")
+            trend_cols = ["Day", "Date", "Inverters", "Working Strings", "Failed Strings", "Availability %"]
+            if isinstance(daily_totals, pd.DataFrame):
+                trend_df = daily_totals.copy()
+            else:
+                trend_df = pd.DataFrame(columns=trend_cols)
+            if not trend_df.empty:
+                trend_df = trend_df[[c for c in trend_cols if c in trend_df.columns]].copy()
+                if "Availability %" in trend_df.columns:
+                    trend_df["Availability %"] = pd.to_numeric(trend_df["Availability %"], errors="coerce").round(2)
+            _style_title(
+                ws_trend,
+                "3-DAY STRING AVAILABILITY TREND",
+                max(len(trend_df.columns), 1) if not trend_df.empty else len(trend_cols),
+                f"Latest Date: {latest_date_display}",
+            )
+            if not trend_df.empty:
+                trend_highlight = {
+                    "Working Strings": (COLORS["success_light"], COLORS["success_green"]),
+                    "Failed Strings": (COLORS["danger_light"], COLORS["danger_red"]),
+                    "Availability %": (COLORS["info_light"], COLORS["info_purple"]),
+                }
+                last_row = _write_table(ws_trend, trend_df, 4, COLORS["info_purple"], trend_highlight)
+                ws_trend.auto_filter.ref = f"A4:{get_column_letter(len(trend_df.columns))}{last_row}"
+            _auto_width(ws_trend)
+            ws_trend.freeze_panes = "A5"
 
         # --- Plot Summary sheet ---------------------------------------------
-        ws_plot = wb.create_sheet("Plot Summary")
-        _style_title(ws_plot, "PLOT-WISE STRING PERFORMANCE", max(len(plot_summary.columns), 1),
-                     f"Latest Date: {latest_date_display} | Threshold <= {threshold} A")
-        if not plot_summary.empty:
-            last_row = _write_table(ws_plot, plot_summary, 4, COLORS["primary_blue"], highlight)
-            ws_plot.auto_filter.ref = f"A4:{get_column_letter(len(plot_summary.columns))}{last_row}"
-            ws_plot.conditional_formatting.add(
-                f"H5:H{last_row}", CellIsRule(operator="lessThan", formula=["90"], fill=_fill(COLORS["warning_light"]))
-            )
-        _auto_width(ws_plot)
-        ws_plot.freeze_panes = "A5"
+        if "plot_summary" in included_sheets:
+            ws_plot = wb.create_sheet("Plot Summary")
+            _style_title(ws_plot, "PLOT-WISE STRING PERFORMANCE", max(len(plot_summary.columns), 1),
+                         f"Latest Date: {latest_date_display} | Threshold <= {threshold} A")
+            if not plot_summary.empty:
+                last_row = _write_table(ws_plot, plot_summary, 4, COLORS["primary_blue"], highlight)
+                ws_plot.auto_filter.ref = f"A4:{get_column_letter(len(plot_summary.columns))}{last_row}"
+                ws_plot.conditional_formatting.add(
+                    f"H5:H{last_row}", CellIsRule(operator="lessThan", formula=["90"], fill=_fill(COLORS["warning_light"]))
+                )
+            _auto_width(ws_plot)
+            ws_plot.freeze_panes = "A5"
 
         # --- Block Summary sheet --------------------------------------------
-        ws_block = wb.create_sheet("Block Summary")
-        _style_title(ws_block, "BLOCK-WISE STRING PERFORMANCE", max(len(block_summary.columns), 1),
-                     f"Latest Date: {latest_date_display} | Threshold <= {threshold} A")
-        if not block_summary.empty:
-            last_row = _write_table(ws_block, block_summary, 4, COLORS["info_purple"], highlight)
-            ws_block.auto_filter.ref = f"A4:{get_column_letter(len(block_summary.columns))}{last_row}"
-        _auto_width(ws_block)
-        ws_block.freeze_panes = "A5"
+        if "block_summary" in included_sheets:
+            ws_block = wb.create_sheet("Block Summary")
+            _style_title(ws_block, "BLOCK-WISE STRING PERFORMANCE", max(len(block_summary.columns), 1),
+                         f"Latest Date: {latest_date_display} | Threshold <= {threshold} A")
+            if not block_summary.empty:
+                last_row = _write_table(ws_block, block_summary, 4, COLORS["info_purple"], highlight)
+                ws_block.auto_filter.ref = f"A4:{get_column_letter(len(block_summary.columns))}{last_row}"
+            _auto_width(ws_block)
+            ws_block.freeze_panes = "A5"
+
+        # --- Inverter Matrix sheet -------------------------------------------
+        if "inverter_matrix" in included_sheets and isinstance(inverter_matrix_df, pd.DataFrame) and not inverter_matrix_df.empty:
+            ws_matrix = wb.create_sheet("Inverter Matrix")
+            _style_title(ws_matrix, "INVERTER MATRIX — WORKING STRINGS BY DAY", max(len(inverter_matrix_df.columns), 1),
+                         f"{number_of_days}-Day Reference | Green = fully working, Amber = small shortfall, Red = larger shortfall")
+            matrix_highlight = {}
+            if "Change" in inverter_matrix_df.columns:
+                matrix_highlight["Change"] = (COLORS["info_light"], COLORS["info_purple"])
+            last_row = _write_table(ws_matrix, inverter_matrix_df, 4, COLORS["dark_grey"], matrix_highlight, zebra=False)
+            # Color each day cell by that row's working/total ratio, matching the dashboard's coding.
+            if matrix_day_cols and "Total Active Strings" in inverter_matrix_df.columns:
+                for r_off, (_, row) in enumerate(inverter_matrix_df.iterrows(), start=5):
+                    total = row.get("Total Active Strings")
+                    for day_col in matrix_day_cols:
+                        if day_col not in inverter_matrix_df.columns:
+                            continue
+                        c_idx = list(inverter_matrix_df.columns).index(day_col) + 1
+                        val = row.get(day_col)
+                        cell = ws_matrix.cell(r_off, c_idx)
+                        if pd.isna(val) or pd.isna(total) or total == 0:
+                            continue
+                        ratio = val / total
+                        if ratio >= 1:
+                            cell.fill = _fill(COLORS["success_light"])
+                            cell.font = Font(color=COLORS["success_green"].lstrip("#"), bold=True)
+                        elif ratio >= 0.9:
+                            cell.fill = _fill(COLORS["warning_light"])
+                            cell.font = Font(color=COLORS["warning_orange"].lstrip("#"), bold=True)
+                        else:
+                            cell.fill = _fill(COLORS["danger_light"])
+                            cell.font = Font(color=COLORS["danger_red"].lstrip("#"), bold=True)
+            ws_matrix.auto_filter.ref = f"A4:{get_column_letter(len(inverter_matrix_df.columns))}{last_row}"
+            _auto_width(ws_matrix)
+            ws_matrix.freeze_panes = "D5"
 
         # --- Failed (Newly Failed) sheet ----------------------------------------------
-        ws_fault = wb.create_sheet("Failed Strings")
         fault_status = inverter_status[["String Inverter", "Working String Count", "Failed String Count"]].rename(
             columns={"Working String Count": "Current Working Strings Count", "Failed String Count": "Current Failed Strings"}
         )
-        # df_newly_failed / df_refailed may already carry these columns (the main app
-        # pre-merges them for the on-screen tabs) - only merge here if they're missing,
-        # otherwise pandas would suffix the duplicate column names and break lookups below.
-        already_has_status_cols = (not df_newly_failed.empty) and "Current Working Strings Count" in df_newly_failed.columns
-        df_fault_export = (
-            df_newly_failed if already_has_status_cols
-            else (df_newly_failed.merge(fault_status, on="String Inverter", how="left") if not df_newly_failed.empty else df_newly_failed)
-        )
-        _style_title(ws_fault, "NEWLY FAILED PV STRINGS", max(len(df_fault_export.columns), 1) if not df_fault_export.empty else 8,
-                     f"Threshold <= {threshold} A")
-        if not df_fault_export.empty:
-            for col in ["Current Working Strings Count", "Current Failed Strings"]:
-                df_fault_export[col] = pd.to_numeric(df_fault_export[col], errors="coerce").fillna(0).astype(int)
-            fault_highlight = dict(highlight)
-            fault_highlight["Current Working Strings Count"] = (COLORS["success_light"], COLORS["success_green"])
-            fault_highlight["Current Failed Strings"] = (COLORS["danger_light"], COLORS["danger_red"])
-            fault_highlight["Fault Type"] = (COLORS["warning_light"], COLORS["warning_orange"])
-            last_row = _write_table(ws_fault, df_fault_export, 4, COLORS["danger_red"], fault_highlight)
-            ws_fault.auto_filter.ref = f"A4:{get_column_letter(len(df_fault_export.columns))}{last_row}"
-        _auto_width(ws_fault)
-        ws_fault.freeze_panes = "A5"
+        if "failed" in included_sheets:
+            ws_fault = wb.create_sheet("Failed Strings")
+            # df_newly_failed / df_refailed may already carry these columns (the main app
+            # pre-merges them for the on-screen tabs) - only merge here if they're missing,
+            # otherwise pandas would suffix the duplicate column names and break lookups below.
+            already_has_status_cols = (not df_newly_failed.empty) and "Current Working Strings Count" in df_newly_failed.columns
+            df_fault_export = (
+                df_newly_failed if already_has_status_cols
+                else (df_newly_failed.merge(fault_status, on="String Inverter", how="left") if not df_newly_failed.empty else df_newly_failed)
+            )
+            _style_title(ws_fault, "NEWLY FAILED PV STRINGS", max(len(df_fault_export.columns), 1) if not df_fault_export.empty else 8,
+                         f"Threshold <= {threshold} A")
+            if not df_fault_export.empty:
+                for col in ["Current Working Strings Count", "Current Failed Strings"]:
+                    df_fault_export[col] = pd.to_numeric(df_fault_export[col], errors="coerce").fillna(0).astype(int)
+                fault_highlight = dict(highlight)
+                fault_highlight["Current Working Strings Count"] = (COLORS["success_light"], COLORS["success_green"])
+                fault_highlight["Current Failed Strings"] = (COLORS["danger_light"], COLORS["danger_red"])
+                fault_highlight["Fault Type"] = (COLORS["warning_light"], COLORS["warning_orange"])
+                last_row = _write_table(ws_fault, df_fault_export, 4, COLORS["danger_red"], fault_highlight)
+                ws_fault.auto_filter.ref = f"A4:{get_column_letter(len(df_fault_export.columns))}{last_row}"
+            _auto_width(ws_fault)
+            ws_fault.freeze_panes = "A5"
 
         # --- Re-Failed sheet ---------------------------------------------------
-        ws_re = wb.create_sheet("Re-Failed Strings")
-        already_has_status_cols_re = (not df_refailed.empty) and "Current Working Strings Count" in df_refailed.columns
-        df_re_export = (
-            df_refailed if already_has_status_cols_re
-            else (df_refailed.merge(fault_status, on="String Inverter", how="left") if not df_refailed.empty else df_refailed)
-        )
-        _style_title(ws_re, "RE-FAILED PV STRINGS", max(len(df_re_export.columns), 1) if not df_re_export.empty else 8,
-                     f"Latest Date: {latest_date_display}")
-        if not df_re_export.empty:
-            for col in ["Current Working Strings Count", "Current Failed Strings"]:
-                df_re_export[col] = pd.to_numeric(df_re_export[col], errors="coerce").fillna(0).astype(int)
-            last_row = _write_table(ws_re, df_re_export, 4, COLORS["danger_red"], highlight)
-            ws_re.auto_filter.ref = f"A4:{get_column_letter(len(df_re_export.columns))}{last_row}"
-        _auto_width(ws_re)
-        ws_re.freeze_panes = "A5"
+        if "refailed" in included_sheets:
+            ws_re = wb.create_sheet("Re-Failed Strings")
+            already_has_status_cols_re = (not df_refailed.empty) and "Current Working Strings Count" in df_refailed.columns
+            df_re_export = (
+                df_refailed if already_has_status_cols_re
+                else (df_refailed.merge(fault_status, on="String Inverter", how="left") if not df_refailed.empty else df_refailed)
+            )
+            _style_title(ws_re, "RE-FAILED PV STRINGS", max(len(df_re_export.columns), 1) if not df_re_export.empty else 8,
+                         f"Latest Date: {latest_date_display}")
+            if not df_re_export.empty:
+                for col in ["Current Working Strings Count", "Current Failed Strings"]:
+                    df_re_export[col] = pd.to_numeric(df_re_export[col], errors="coerce").fillna(0).astype(int)
+                last_row = _write_table(ws_re, df_re_export, 4, COLORS["danger_red"], highlight)
+                ws_re.auto_filter.ref = f"A4:{get_column_letter(len(df_re_export.columns))}{last_row}"
+            _auto_width(ws_re)
+            ws_re.freeze_panes = "A5"
 
         # --- Negative Values sheet ----------------------------------------------
-        if df_negative_current is not None:
+        if "negative" in included_sheets and df_negative_current is not None:
             ws_neg = wb.create_sheet("Negative Values")
             _style_title(ws_neg, "NEGATIVE STRING READINGS", max(len(df_negative_current.columns), 1) if not df_negative_current.empty else 8,
                          f"Latest Date: {latest_date_display}")
@@ -952,7 +1146,7 @@ def render_analysis_page(current_user):
             ws_neg.freeze_panes = "A5"
 
         # --- Low Performance sheet ----------------------------------------------
-        if df_low_perf is not None:
+        if "low_perf" in included_sheets and df_low_perf is not None:
             ws_lp = wb.create_sheet("Low Performance")
             _style_title(ws_lp, "LOW PERFORMING STRINGS", max(len(df_low_perf.columns), 1) if not df_low_perf.empty else 8,
                          f"Latest Date: {latest_date_display}")
@@ -964,7 +1158,7 @@ def render_analysis_page(current_user):
             ws_lp.freeze_panes = "A5"
 
         # --- Duplicate / Excluded Inverters sheet --------------------------------
-        if duplicate_ids_by_day or excluded_ids_by_day:
+        if "duplicates" in included_sheets and (duplicate_ids_by_day or excluded_ids_by_day):
             ws_dup = wb.create_sheet("Duplicate Inverters")
             rows = []
             for dk, ids in (duplicate_ids_by_day or {}).items():
@@ -981,6 +1175,11 @@ def render_analysis_page(current_user):
             _auto_width(ws_dup)
             ws_dup.freeze_panes = "A5"
 
+        if len(wb.sheetnames) == 0:
+            # Every sheet was deselected - still return a valid, openable workbook.
+            ws_empty = wb.create_sheet("Report")
+            _style_title(ws_empty, "NO SHEETS SELECTED", 4, "Choose at least one report on the Export tab and regenerate.")
+
         buf = io.BytesIO()
         wb.save(buf)
         buf.seek(0)
@@ -996,17 +1195,50 @@ def render_analysis_page(current_user):
         st.caption("Multi-day SCADA string fault analysis")
         st.markdown("---")
 
-        st.markdown("**Upload SCADA files by day**")
+        st.markdown("**Data source**")
+        data_source_mode = st.radio(
+            "Data source",
+            options=["Saved snapshots", "Upload files"],
+            index=0,
+            key="analysis_data_source_mode",
+            label_visibility="collapsed",
+            help="Saved snapshots reuse the data already preprocessed on the Dashboard tab - no re-upload needed. Upload files lets you analyze workbooks directly with fully custom settings below.",
+        )
         st.caption("Each day is processed independently, then compared to detect faults.")
-        day1_file = st.file_uploader("Day 1 (oldest)", type=["xlsx"], accept_multiple_files=False, key="day1_upload")
-        day2_file = st.file_uploader("Day 2", type=["xlsx"], accept_multiple_files=False, key="day2_upload")
-        day3_file = st.file_uploader("Day 3 (latest, optional)", type=["xlsx"], accept_multiple_files=False, key="day3_upload")
+
+        day1_file = day2_file = day3_file = None
+        saved_dates_by_day = {}
+
+        if data_source_mode == "Saved snapshots":
+            available_dates = sorted(storage1.get_available_snapshot_dates())
+            if not available_dates:
+                st.warning("No preprocessed snapshots are available yet. Upload a file on the Dashboard tab first, or switch to \"Upload files\" here.")
+            else:
+                selected_dates = st.multiselect(
+                    "Select up to 3 snapshot dates to compare",
+                    options=available_dates,
+                    default=available_dates[-1:],
+                    max_selections=3,
+                    key="analysis_saved_dates",
+                    help="Pick 1-3 dates. They're automatically ordered oldest \u2192 latest regardless of pick order.",
+                )
+                selected_dates = sorted(selected_dates)
+                for label, date_str in zip(DAY_LABELS, selected_dates):
+                    saved_dates_by_day[label] = date_str
+                if selected_dates:
+                    st.caption("Using: " + " \u2192 ".join(selected_dates))
+        else:
+            day1_file = st.file_uploader("Day 1 (oldest)", type=["xlsx"], accept_multiple_files=False, key="day1_upload")
+            day2_file = st.file_uploader("Day 2", type=["xlsx"], accept_multiple_files=False, key="day2_upload")
+            day3_file = st.file_uploader("Day 3 (latest, optional)", type=["xlsx"], accept_multiple_files=False, key="day3_upload")
 
         with st.expander("Analysis Settings", icon=":material/tune:", expanded=False):
             threshold = st.number_input("Working current threshold (A)", min_value=0.0, max_value=5.0,
-                                         value=DEFAULT_THRESHOLD, step=0.1)
+                                         value=DEFAULT_THRESHOLD, step=0.1,
+                                         help="Used for fault comparison across days in both data source modes.")
             default_active = st.number_input("Default active strings / block", min_value=1, max_value=100,
-                                              value=DEFAULT_TOTAL_ACTIVE_STRINGS, step=1)
+                                              value=DEFAULT_TOTAL_ACTIVE_STRINGS, step=1,
+                                              disabled=(data_source_mode == "Saved snapshots"))
             dup_exclude_threshold = st.number_input(
                 "Exclude inverter if duplicate rows >=", min_value=2, max_value=20,
                 value=DEFAULT_DUPLICATE_EXCLUDE_THRESHOLD, step=1,
@@ -1017,13 +1249,18 @@ def render_analysis_page(current_user):
                 value=int(DEFAULT_LOW_PERF_RATIO * 100), step=5,
                 help="A working string below this % of its own inverter's median current is flagged as low performing.",
             )
+            if data_source_mode == "Saved snapshots":
+                st.caption("Active-string overrides are already baked into saved snapshots from the Dashboard. Duplicate-ID detection above still runs on snapshot data. Switch to \"Upload files\" to control overrides here.")
             low_perf_ratio = low_perf_ratio_pct / 100.0
 
         with st.expander("Active-String Overrides", icon=":material/table_rows:", expanded=False):
             st.caption("Blocks with fewer active strings than the default")
+            if data_source_mode == "Saved snapshots":
+                st.caption("Not used in Saved snapshots mode - already applied on the Dashboard.")
             overrides_df = st.data_editor(
                 pd.DataFrame(DEFAULT_OVERRIDES_ROWS), num_rows="dynamic", use_container_width=True,
                 key="overrides_editor",
+                disabled=(data_source_mode == "Saved snapshots"),
             )
 
         st.markdown("---")
@@ -1044,18 +1281,34 @@ def render_analysis_page(current_user):
     # PIPELINE — runs automatically whenever a file or setting changes
     # ============================================================================
 
-    day_files = []
-    for label, f in zip(DAY_LABELS, [day1_file, day2_file, day3_file]):
-        if f is not None:
-            day_files.append((label, f))
+    # ============================================================================
+    # PIPELINE — runs automatically whenever a file/date-selection or setting changes
+    # ============================================================================
 
+    if data_source_mode == "Saved snapshots":
+        day_files = [(label, date_str) for label, date_str in saved_dates_by_day.items()]
+    else:
+        day_files = []
+        for label, f in zip(DAY_LABELS, [day1_file, day2_file, day3_file]):
+            if f is not None:
+                day_files.append((label, f))
 
-    def files_signature(day_files, overrides_json, threshold, default_active, dup_exclude_threshold, low_perf_ratio):
+    def files_signature(mode, day_files, overrides_json, threshold, default_active, dup_exclude_threshold, low_perf_ratio):
         h = hashlib.sha256()
-        for day_key, f in day_files:
+        h.update(mode.encode())
+        for day_key, payload in day_files:
             h.update(day_key.encode())
-            h.update(f.name.encode())
-            h.update(f.getvalue())
+            if mode == "Saved snapshots":
+                # payload is a snapshot date string; also fold in the underlying
+                # upload's hash/timestamp so re-uploading data for that date busts the cache.
+                entry = storage1.get_upload_for_date(payload)
+                h.update(payload.encode())
+                if entry:
+                    h.update(str(entry.get("file_hash", "")).encode())
+                    h.update(str(entry.get("upload_timestamp", "")).encode())
+            else:
+                h.update(payload.name.encode())
+                h.update(payload.getvalue())
         h.update(overrides_json.encode())
         h.update(str(threshold).encode())
         h.update(str(default_active).encode())
@@ -1065,32 +1318,57 @@ def render_analysis_page(current_user):
 
 
     if day_files:
-        sig = files_signature(day_files, overrides_json, threshold, default_active, dup_exclude_threshold, low_perf_ratio)
+        sig = files_signature(data_source_mode, day_files, overrides_json, threshold, default_active, dup_exclude_threshold, low_perf_ratio)
         needs_run = process_clicked or (st.session_state["last_signature"] != sig)
 
         if needs_run:
-            with st.spinner("Parsing workbooks & computing string metrics..."):
+            spinner_text = "Loading saved snapshots..." if data_source_mode == "Saved snapshots" else "Parsing workbooks & computing string metrics..."
+            with st.spinner(spinner_text):
                 processed_days, file_names_by_day, missing_any = {}, {}, []
                 duplicate_rows_by_day, excluded_rows_by_day = {}, {}
 
-                for day_key, f in day_files:
-                    sheets, missing_log = process_scada_excel_bytes(f.getvalue(), f.name, overrides_json, int(default_active), float(threshold))
-                    target_sheet = "Sheet1" if "Sheet1" in sheets else (next(iter(sheets)) if sheets else None)
-                    if not target_sheet:
-                        missing_any.append(f.name)
-                        continue
+                if data_source_mode == "Saved snapshots":
+                    for day_key, snapshot_date in day_files:
+                        dfs, entry = storage1.get_processed_dataframes_for_date(snapshot_date)
+                        if not dfs:
+                            missing_any.append(snapshot_date)
+                            continue
+                        target_sheet = "Sheet1" if "Sheet1" in dfs else next(iter(dfs))
+                        raw_df = dfs[target_sheet]
 
-                    raw_df = sheets[target_sheet]
-                    df_calc, df_dup_rows, df_excluded, dup_ids, excluded_ids = handle_duplicate_inverters(
-                        raw_df, exclude_threshold=int(dup_exclude_threshold)
-                    )
-                    processed_days[day_key] = df_calc
-                    duplicate_rows_by_day[day_key] = df_dup_rows
-                    excluded_rows_by_day[day_key] = df_excluded
-                    file_names_by_day[day_key] = f.name
+                        # Snapshots are pre-processed by the Dashboard pipeline, but that
+                        # pipeline doesn't currently exclude/flag duplicate inverter ID rows,
+                        # so duplicates can still be present here. Run the same detection
+                        # used for direct uploads instead of assuming it's already clean.
+                        df_calc, df_dup_rows, df_excluded, dup_ids, excluded_ids = handle_duplicate_inverters(
+                            raw_df, exclude_threshold=int(dup_exclude_threshold)
+                        )
+                        processed_days[day_key] = df_calc
+                        duplicate_rows_by_day[day_key] = df_dup_rows
+                        excluded_rows_by_day[day_key] = df_excluded
+                        file_names_by_day[day_key] = (entry or {}).get("original_filename", snapshot_date)
 
-                day_keys = [dk for dk, _ in day_files if dk in processed_days]
-                date_mapping = {dk: (extract_date_from_filename(file_names_by_day[dk]) or dk) for dk in day_keys}
+                    day_keys = [dk for dk, _ in day_files if dk in processed_days]
+                    date_mapping = {dk: date_str for dk, date_str in day_files if dk in processed_days}
+                else:
+                    for day_key, f in day_files:
+                        sheets, missing_log = process_scada_excel_bytes(f.getvalue(), f.name, overrides_json, int(default_active), float(threshold))
+                        target_sheet = "Sheet1" if "Sheet1" in sheets else (next(iter(sheets)) if sheets else None)
+                        if not target_sheet:
+                            missing_any.append(f.name)
+                            continue
+
+                        raw_df = sheets[target_sheet]
+                        df_calc, df_dup_rows, df_excluded, dup_ids, excluded_ids = handle_duplicate_inverters(
+                            raw_df, exclude_threshold=int(dup_exclude_threshold)
+                        )
+                        processed_days[day_key] = df_calc
+                        duplicate_rows_by_day[day_key] = df_dup_rows
+                        excluded_rows_by_day[day_key] = df_excluded
+                        file_names_by_day[day_key] = f.name
+
+                    day_keys = [dk for dk, _ in day_files if dk in processed_days]
+                    date_mapping = {dk: (extract_date_from_filename(file_names_by_day[dk]) or dk) for dk in day_keys}
 
                 st.session_state["processed_days"] = processed_days
                 st.session_state["duplicate_rows_by_day"] = duplicate_rows_by_day
@@ -1111,9 +1389,13 @@ def render_analysis_page(current_user):
                     st.session_state["fault_df"] = None
 
                 if missing_any:
-                    st.warning(f"Could not detect a valid header/inverter column in: {', '.join(missing_any)}")
+                    if data_source_mode == "Saved snapshots":
+                        st.warning(f"No preprocessed data could be loaded for: {', '.join(missing_any)}")
+                    else:
+                        st.warning(f"Could not detect a valid header/inverter column in: {', '.join(missing_any)}")
     else:
         st.session_state["last_signature"] = None
+
 
     # ============================================================================
     # MAIN AREA
@@ -1168,6 +1450,12 @@ def render_analysis_page(current_user):
     # Low performance strings (req #6)
     df_low_perf = compute_low_performance_strings(latest_df, float(threshold), float(low_perf_ratio))
 
+    # 3-day (or however many days are loaded) roll-up used for the Dashboard trend section + Excel export
+    daily_totals = compute_daily_totals(processed_days, comparison_day_keys, date_mapping)
+
+    # Per-inverter, per-day Working String Count grid (Inverter Matrix tab)
+    inverter_matrix_df, matrix_day_cols = build_inverter_matrix(processed_days, comparison_day_keys, date_mapping)
+
     # Duplicate inverter roll-up across all uploaded days (req #3)
     duplicate_ids_by_day = {dk: sorted(df["String Inverter"].astype(str).str.strip().unique().tolist())
                              for dk, df in duplicate_rows_by_day.items() if not df.empty}
@@ -1198,16 +1486,17 @@ def render_analysis_page(current_user):
 
     day_tab_labels = [f":material/calendar_today: {dk}" for dk in comparison_day_keys]
     tab_labels = (
-        [":material/dashboard: Dashboard", ":material/pin_drop: Plot Summary", ":material/grid_view: Block Summary"]
+        [":material/dashboard: Dashboard", ":material/pin_drop: Plot Summary", ":material/grid_view: Block Summary",
+         ":material/apps: Inverter Matrix"]
         + day_tab_labels
         + [":material/report: Failed Strings", ":material/history: Re-Failed Strings",
            ":material/trending_down: Negative Values", ":material/speed: Low Performance",
            ":material/file_download: Export"]
     )
     tabs = st.tabs(tab_labels)
-    tab_dash, tab_plot, tab_block = tabs[0], tabs[1], tabs[2]
-    day_tabs = tabs[3:3 + len(comparison_day_keys)]
-    tab_failed, tab_refailed, tab_negative, tab_lowperf, tab_export = tabs[3 + len(comparison_day_keys):]
+    tab_dash, tab_plot, tab_block, tab_matrix = tabs[0], tabs[1], tabs[2], tabs[3]
+    day_tabs = tabs[4:4 + len(comparison_day_keys)]
+    tab_failed, tab_refailed, tab_negative, tab_lowperf, tab_export = tabs[4 + len(comparison_day_keys):]
 
     # ---------------------------------------------------------------- Dashboard
     with tab_dash:
@@ -1230,6 +1519,54 @@ def render_analysis_page(current_user):
         c12.metric("Duplicate Inverter IDs", f"{total_duplicate_ids:,}", help="Kept in calculations, flagged for review")
 
         st.markdown("<br>", unsafe_allow_html=True)
+
+        # --------------------------------------------------------- 3-Day Summary
+        st.markdown('<div class="section-title"><i class="fa-solid fa-calendar-week"></i>3-Day Summary</div>', unsafe_allow_html=True)
+        if daily_totals.empty:
+            st.info("No day-level data available yet.")
+        else:
+            trend_left, trend_right = st.columns([1.3, 1])
+
+            with trend_left:
+                trend_fig = go.Figure()
+                trend_fig.add_trace(go.Scatter(
+                    x=daily_totals["Day"], y=daily_totals["Working Strings"], name="Working Strings",
+                    mode="lines+markers", line=dict(color=COLORS["success_green"], width=3),
+                    marker=dict(size=9), fill="tozeroy", fillcolor="rgba(56,161,105,0.12)",
+                ))
+                trend_fig.add_trace(go.Scatter(
+                    x=daily_totals["Day"], y=daily_totals["Failed Strings"], name="Failed Strings",
+                    mode="lines+markers", line=dict(color=COLORS["danger_red"], width=3),
+                    marker=dict(size=9), fill="tozeroy", fillcolor="rgba(229,62,62,0.12)",
+                ))
+                trend_fig.add_trace(go.Scatter(
+                    x=daily_totals["Day"], y=daily_totals["Availability %"], name="Availability %",
+                    mode="lines+markers", line=dict(color=COLORS["primary_blue"], width=2, dash="dot"),
+                    marker=dict(size=7, symbol="diamond"), yaxis="y2",
+                ))
+                trend_fig.update_layout(
+                    height=360, margin=dict(t=30, b=10, l=10, r=10),
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02),
+                    xaxis=dict(title=None),
+                    yaxis=dict(title="Strings"),
+                    yaxis2=dict(title="Availability %", overlaying="y", side="right", range=[0, 100], showgrid=False),
+                    hovermode="x unified",
+                )
+                st.plotly_chart(trend_fig, use_container_width=True)
+
+            with trend_right:
+                summary_view = daily_totals[["Day", "Date", "Inverters", "Working Strings", "Failed Strings", "Availability %"]]
+                styled_daily = summary_view.style.background_gradient(subset=["Availability %"], cmap="RdYlGn", vmin=0, vmax=100) \
+                    .format({"Availability %": "{:.2f}%"})
+                st.dataframe(styled_daily, use_container_width=True, hide_index=True)
+                if len(daily_totals) >= 2:
+                    delta_working = int(daily_totals.iloc[-1]["Working Strings"] - daily_totals.iloc[0]["Working Strings"])
+                    delta_avail = round(daily_totals.iloc[-1]["Availability %"] - daily_totals.iloc[0]["Availability %"], 2)
+                    st.metric(
+                        f"Change: {daily_totals.iloc[0]['Day']} \u2192 {daily_totals.iloc[-1]['Day']}",
+                        f"{delta_working:+,} working strings", f"{delta_avail:+.2f} pts availability",
+                    )
+
         left, right = st.columns([1.4, 1])
 
         with left:
@@ -1323,6 +1660,72 @@ def render_analysis_page(current_user):
                 .background_gradient(subset=["Failed Strings"], cmap="Reds") \
                 .format({"Availability %": "{:.2f}%", "Failure %": "{:.2f}%"})
             st.dataframe(styled, use_container_width=True, hide_index=True)
+
+    # ------------------------------------------------------------- Inverter Matrix
+    with tab_matrix:
+        st.markdown('<div class="section-title"><i class="fa-solid fa-table-list"></i>Inverter Matrix — Working Strings by Day</div>', unsafe_allow_html=True)
+        st.caption(
+            "Each day's cell shows that inverter's Working String Count. "
+            "Green = fully working that day (matches Total Active Strings), amber = a small "
+            "shortfall, red = a larger shortfall — so a drop and later recovery (e.g. 19 → 18 → 19) "
+            "is visible at a glance across the day columns."
+        )
+        if inverter_matrix_df.empty:
+            st.info("No inverter-level data available yet.")
+        else:
+            im1, im2, im3, im4 = st.columns(4)
+            im1.metric("Inverters", f"{inverter_matrix_df['String Inverter'].nunique():,}" if "String Inverter" in inverter_matrix_df else "0")
+            if "Change" in inverter_matrix_df.columns:
+                improved = int((inverter_matrix_df["Change"] > 0).sum())
+                declined = int((inverter_matrix_df["Change"] < 0).sum())
+                stable = int((inverter_matrix_df["Change"] == 0).sum())
+                im2.metric("Improved", f"{improved:,}", help=f"{matrix_day_cols[0]} \u2192 {matrix_day_cols[-1]}")
+                im3.metric("Declined", f"{declined:,}", help=f"{matrix_day_cols[0]} \u2192 {matrix_day_cols[-1]}")
+                im4.metric("Stable", f"{stable:,}")
+            st.markdown("<br>", unsafe_allow_html=True)
+
+            im_c1, im_c2, im_c3 = st.columns(3)
+            plots_im = ["All"] + sorted(inverter_matrix_df["Plot"].astype(str).unique().tolist()) if "Plot" in inverter_matrix_df else ["All"]
+            chosen_plot_im = im_c1.selectbox("Plot", plots_im, key="matrix_plot_filter")
+            search_im = im_c2.text_input("Search inverter ID", key="matrix_search")
+            only_changed = im_c3.checkbox("Only show inverters with a change", value=False, key="matrix_only_changed")
+
+            view = inverter_matrix_df.copy()
+            if chosen_plot_im != "All":
+                view = view[view["Plot"] == chosen_plot_im]
+            if search_im and "String Inverter" in view.columns:
+                view = view[view["String Inverter"].astype(str).str.contains(search_im, case=False, na=False)]
+            if only_changed and "Change" in view.columns:
+                view = view[view["Change"] != 0]
+
+            def _matrix_row_style(row):
+                styles = [""] * len(row)
+                total = row.get("Total Active Strings")
+                for i, col in enumerate(row.index):
+                    if col in matrix_day_cols:
+                        val = row[col]
+                        if pd.isna(val) or pd.isna(total) or total == 0:
+                            continue
+                        ratio = val / total
+                        if ratio >= 1:
+                            styles[i] = f"background-color: {COLORS['success_light']}; color: {COLORS['success_green']}; font-weight: 700;"
+                        elif ratio >= 0.9:
+                            styles[i] = f"background-color: {COLORS['warning_light']}; color: {COLORS['warning_orange']}; font-weight: 700;"
+                        else:
+                            styles[i] = f"background-color: {COLORS['danger_light']}; color: {COLORS['danger_red']}; font-weight: 700;"
+                    elif col == "Change" and pd.notna(row.get("Change")):
+                        if row["Change"] > 0:
+                            styles[i] = f"background-color: {COLORS['success_light']}; color: {COLORS['success_green']}; font-weight: 700;"
+                        elif row["Change"] < 0:
+                            styles[i] = f"background-color: {COLORS['danger_light']}; color: {COLORS['danger_red']}; font-weight: 700;"
+                return styles
+
+            styled_matrix = view.style.apply(_matrix_row_style, axis=1)
+            st.dataframe(styled_matrix, use_container_width=True, hide_index=True)
+            st.download_button(
+                "Download CSV", view.to_csv(index=False).encode(),
+                "inverter_matrix.csv", "text/csv", icon=":material/download:", key="dl_matrix",
+            )
 
     # ------------------------------------------------------------------ Day tabs
     for dk, tab in zip(comparison_day_keys, day_tabs):
@@ -1430,20 +1833,71 @@ def render_analysis_page(current_user):
     # ---------------------------------------------------------------- Export
     with tab_export:
         st.markdown('<div class="section-title"><i class="fa-solid fa-file-export"></i>Full Excel Report</div>', unsafe_allow_html=True)
-        st.write(
-            "Generates the multi-sheet workbook (Dashboard, Plot/Block Summary, Failed Strings, Re-Failed Strings, "
-            "Negative Values, Low Performance, Duplicate Inverters) with the same styling as the original Colab report."
-        )
-        if st.button("Generate Excel Report", icon=":material/description:", type="primary"):
+        st.caption("Choose which reports to include, then generate. Everything is selected by default.")
+
+        # Sheets that only make sense when their underlying data actually exists this run.
+        availability_by_key = {
+            "dashboard": True,
+            "trend": not daily_totals.empty,
+            "plot_summary": not plot_summary.empty,
+            "block_summary": not block_summary.empty,
+            "inverter_matrix": not inverter_matrix_df.empty,
+            "failed": True,
+            "refailed": True,
+            "negative": True,
+            "low_perf": True,
+            "duplicates": bool(duplicate_ids_by_day or excluded_ids_by_day),
+        }
+
+        sel_col1, sel_col2, sel_col3 = st.columns([1, 1, 1])
+        with sel_col1:
+            if st.button("Select all", use_container_width=True, key="export_select_all"):
+                for key, _ in EXPORT_SHEET_OPTIONS:
+                    st.session_state[f"export_chk_{key}"] = availability_by_key.get(key, True)
+        with sel_col2:
+            if st.button("Select none", use_container_width=True, key="export_select_none"):
+                for key, _ in EXPORT_SHEET_OPTIONS:
+                    st.session_state[f"export_chk_{key}"] = False
+        with sel_col3:
+            if st.button("Failures-only", use_container_width=True, key="export_select_failures",
+                         help="Just the Failed Strings, Re-Failed Strings, Negative Values and Low Performance sheets."):
+                failures_only = {"failed", "refailed", "negative", "low_perf"}
+                for key, _ in EXPORT_SHEET_OPTIONS:
+                    st.session_state[f"export_chk_{key}"] = key in failures_only
+
+        st.markdown("<br>", unsafe_allow_html=True)
+        check_cols = st.columns(2)
+        selected_sheets = set()
+        for i, (key, label) in enumerate(EXPORT_SHEET_OPTIONS):
+            available = availability_by_key.get(key, True)
+            col = check_cols[i % 2]
+            default_checked = st.session_state.get(f"export_chk_{key}", True) and available
+            checked = col.checkbox(
+                label if available else f"{label} (no data this run)",
+                value=default_checked,
+                key=f"export_chk_{key}",
+                disabled=not available,
+            )
+            if checked and available:
+                selected_sheets.add(key)
+
+        st.markdown("<br>", unsafe_allow_html=True)
+        if not selected_sheets:
+            st.warning("Select at least one report to include in the export.", icon=":material/warning:")
+
+        if st.button("Generate Excel Report", icon=":material/description:", type="primary", disabled=not selected_sheets):
             with st.spinner("Building workbook..."):
                 report_bytes = generate_excel_report(
                     kpis, plot_summary, block_summary, df_newly_failed_ui, df_refailed_ui,
                     inverter_status, comparison_day_keys, date_mapping, threshold,
                     df_negative_current=df_negative_current, df_low_perf=df_low_perf,
                     duplicate_ids_by_day=duplicate_ids_by_day, excluded_ids_by_day=excluded_ids_by_day,
+                    daily_totals=daily_totals, inverter_matrix_df=inverter_matrix_df,
+                    matrix_day_cols=matrix_day_cols, included_sheets=selected_sheets,
                 )
                 st.session_state["excel_report_bytes"] = report_bytes
                 st.session_state["excel_report_name"] = f"PV_Plant_Report_{latest_key}_{date_mapping.get(latest_key, '')}.xlsx"
+            st.success(f"Report generated with {len(selected_sheets)} sheet(s) — download it below.", icon=":material/check_circle:")
 
         if st.session_state["excel_report_bytes"]:
             st.download_button(
