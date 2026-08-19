@@ -225,7 +225,7 @@ MANUAL_SCADA_COLUMNS = [
 ROLE_BADGES = {
     "admin": "👑 Admin",
     "manager": "🧭 Manager",
-    "engineer": "🔧 Engineer",
+    "engineer": "🔧 AM/Engineer",
 }
 
 # ==========================================
@@ -286,11 +286,42 @@ def extract_block_cached(inverter_id_str):
             return parts[1].strip()
     return "Unknown Block"
 
+# @lru_cache(maxsize=128)
+# def map_inverter_to_sacu_cached(inverter_id_str):
+#     if not isinstance(inverter_id_str, str):
+#         return "Invalid Inverter ID"
+
+#     match = re.search(r'-(\d[\.\-]\d)-', inverter_id_str)
+#     if match:
+#         sacu_identifier = match.group(1)
+#         try:
+#             if "." in sacu_identifier:
+#                 first_digit_str = sacu_identifier.split(".")[0]
+#             else:
+#                 first_digit_str = sacu_identifier.split("-")[0]
+#             first_digit = int(first_digit_str)
+#             if first_digit in [1, 2]:
+#                 return "SACU-1"
+#             elif first_digit in [3, 4]:
+#                 return "SACU-2"
+#         except ValueError:
+#             pass
+#     return "Unknown SACU"
 @lru_cache(maxsize=128)
 def map_inverter_to_sacu_cached(inverter_id_str):
     if not isinstance(inverter_id_str, str):
         return "Invalid Inverter ID"
 
+    # Standardize to uppercase for safe checking
+    upper_id = inverter_id_str.upper()
+
+    # Check for LT designations first
+    if "LT1" in upper_id or "LT2" in upper_id:
+        return "SACU-1"
+    elif "LT3" in upper_id or "LT4" in upper_id:
+        return "SACU-2"
+
+    # Fallback to the original regex pattern for numeric block identifiers
     match = re.search(r'-(\d[\.\-]\d)-', inverter_id_str)
     if match:
         sacu_identifier = match.group(1)
@@ -306,6 +337,7 @@ def map_inverter_to_sacu_cached(inverter_id_str):
                 return "SACU-2"
         except ValueError:
             pass
+            
     return "Unknown SACU"
 
 def sorted_filter_options(series):
@@ -664,7 +696,7 @@ MANUAL_SCADA_COLUMNS = [
 ROLE_BADGES = {
     "admin": '<i class="fas fa-crown"></i> Admin',
     "manager": '<i class="fas fa-compass"></i> Manager',
-    "engineer": '<i class="fas fa-wrench"></i> Engineer',
+    "engineer": '<i class="fas fa-wrench"></i> AM/Engineer',
 }
 
 def process_and_save_upload(file_bytes, filename, snapshot_date, username, role):
@@ -2364,12 +2396,12 @@ def create_plot_charts_cached(plot_summary):
 
 def display_plot_metrics(plot_summary):
     st.markdown('<i class="fas fa-chart-pie"></i> Plot-wise Performance Overview', unsafe_allow_html=True)
-    cols = st.columns(min(5, len(plot_summary)))
+    cols = st.columns(min(6, len(plot_summary)))
 
     for idx, (_, row) in enumerate(plot_summary.iterrows()):
-        if idx >= 5:
+        if idx >= 6:
             break
-        col_idx = idx % 5
+        col_idx = idx % 6
         with cols[col_idx]:
             avail = row["Availability (%)"]
             if avail >= 90:
